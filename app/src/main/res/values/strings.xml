@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AndroidInstrumentedTest</string>
+    <string name="app_title">中文输入法尾简拼自动评测程序</string>
+</resources>
