@@ -1,6 +1,7 @@
 package com.example.androidinstrumentedtest
 
 import android.content.Intent
+import android.graphics.Color
 import android.util.Log
 import android.view.KeyEvent
 import androidx.test.core.app.ApplicationProvider
@@ -26,6 +27,7 @@ data class EvaluationResult(
     val targetWord: String,
     var selectedWord: String = "",
     var wasFound: Boolean = false,
+    var selectedNo: Int = 0, // Position of the matched candidate (1-5), or 0 if not found
     var message: String = ""
 )
 
@@ -43,7 +45,7 @@ class KeyboardEvaluationTest {
     private val results = mutableListOf<EvaluationResult>()
     private val tag = "KeyboardEvaluator"
     private val editTextResId = "com.example.androidinstrumentedtest:id/evaluation_edit_text"
-    private val startButtonResId = "com.example.androidinstrumentedtest:id/start_test_button"
+    private val MAX_CANDIDATES_TO_CHECK = 5
 
     @Before
     fun setup() {
@@ -58,43 +60,77 @@ class KeyboardEvaluationTest {
             return
         }
 
-        val startButton = uiDevice.wait(Until.findObject(By.res(startButtonResId)), 5000)
-        assertNotNull("Start button not found", startButton)
-        startButton.click()
+        activityRule.scenario.onActivity {
+            it.setReportText("测试正在进行中...\n")
+        }
 
         val editText = uiDevice.wait(Until.findObject(By.res(editTextResId)), 5000)
         assertNotNull("Evaluation edit text not found", editText)
-        editText.click()
 
         testData.forEach { (pinyin, target) ->
             val result = EvaluationResult(pinyin, target)
             Log.d(tag, "--- Testing: pinyin='$pinyin', target='$target' ---")
 
-            editText.text = ""
-            pinyin.forEach { char ->
-                val keyCode = getKeyCode(char)
-                if (keyCode != -1) uiDevice.pressKeyCode(keyCode)
+            var foundMatch = false
+            for (i in 1..MAX_CANDIDATES_TO_CHECK) {
+                // Type the pinyin sequence
+                editText.click()
+                editText.text = ""
+                Thread.sleep(100) // UI ready delay
+                pinyin.forEach { char ->
+                    val keyCode = getKeyCode(char)
+                    if (keyCode != -1) uiDevice.pressKeyCode(keyCode)
+                }
+                Thread.sleep(500) // Wait for candidates to appear
+
+                // Navigate to the i-th candidate.
+                // For i=1, no move. For i=2, 1 right move, etc.
+                for (j in 1 until i) {
+                    uiDevice.pressKeyCode(KeyEvent.KEYCODE_DPAD_RIGHT)
+                    Thread.sleep(100)
+                }
+
+                // Select the candidate
+                uiDevice.pressKeyCode(KeyEvent.KEYCODE_SPACE)
+                Thread.sleep(200)
+
+                val currentSelection = editText.text.trim()
+
+                if (currentSelection == target.trim()) {
+                    result.selectedWord = currentSelection
+                    result.wasFound = true
+                    result.selectedNo = i
+                    result.message = "Success: Matched target at candidate #$i."
+                    Log.i(tag, result.message)
+                    foundMatch = true
+                    break // Exit the candidate-checking loop
+                } else {
+                    // If not matched, clear the edit text for the next attempt in the loop
+                    editText.text = ""
+                }
             }
 
-            // Wait for candidates to appear.
-            Thread.sleep(2000)
-
-            // Press space to select the first candidate.
-            uiDevice.pressKeyCode(KeyEvent.KEYCODE_SPACE)
-
-            result.selectedWord = editText.text
-
-            if (result.selectedWord.trim() == target.trim()) {
-                result.wasFound = true
-                result.message = "Success: First candidate matched target."
-                Log.i(tag, result.message)
-            } else {
+            if (!foundMatch) {
                 result.wasFound = false
-                val selectedForMessage = if (result.selectedWord.isBlank()) "<empty>" else result.selectedWord
-                result.message = "Failure: First candidate ('$selectedForMessage') != target."
+                result.selectedNo = 0
+                result.message = "Failure: Target not found in the first $MAX_CANDIDATES_TO_CHECK candidates."
                 Log.w(tag, result.message)
             }
+
             results.add(result)
+            sendPartialReport(result)
+        }
+    }
+
+    private fun sendPartialReport(result: EvaluationResult) {
+        val status = if (result.wasFound) "SUCCESS" else "FAILURE"
+        val partialReport = String.format("%-7s | %-15s | %-10s | Pos: %-2d | %s\n",
+            status, result.pinyinSequence, result.targetWord, result.selectedNo, result.message)
+
+        val color = if (result.wasFound) Color.GREEN else Color.RED
+
+        activityRule.scenario.onActivity {
+            it.setReportText(partialReport, color)
         }
     }
 
@@ -102,28 +138,41 @@ class KeyboardEvaluationTest {
     fun generateReport() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         if (results.isEmpty()) {
-            context.sendBroadcast(Intent(MainActivity.TEST_FINISHED))
+            activityRule.scenario.onActivity {
+                it.setReportText("No results to display.")
+            }
             return
         }
 
         val reportBuilder = StringBuilder()
         reportBuilder.append("=========== KEYBOARD EVALUATION REPORT ============\n")
-        reportBuilder.append(String.format("%-4s | %-7s | %-15s | %-10s | %-10s | %s\n",
-            "No.", "Status", "Pinyin", "Target", "Selected", "Message"))
+        reportBuilder.append(String.format("%-4s | %-7s | %-15s | %-10s | %-10s | %-3s | %s\n",
+            "No.", "Status", "Pinyin", "Target", "Selected", "Pos", "Message"))
         results.forEachIndexed { index, result ->
             val status = if (result.wasFound) "SUCCESS" else "FAILURE"
-            reportBuilder.append(String.format("%-4d | %-7s | %-15s | %-10s | %-10s | %s\n",
-                index + 1, status, result.pinyinSequence, result.targetWord, result.selectedWord, result.message))
+            reportBuilder.append(String.format("%-4d | %-7s | %-15s | %-10s | %-10s | %-3d | %s\n",
+                index + 1, status, result.pinyinSequence, result.targetWord, result.selectedWord, result.selectedNo, result.message))
         }
 
-        val successCount = results.count { it.wasFound }
         val totalCount = results.size
-        val successRate = if (totalCount > 0) (successCount.toDouble() / totalCount) * 100 else 0.0
+        val successCount = results.count { it.wasFound }
+        val top1Count = results.count { it.selectedNo == 1 }
+        val top2to5Count = results.count { it.selectedNo in 2..MAX_CANDIDATES_TO_CHECK }
+        val notFoundCount = results.count { it.selectedNo == 0 }
+
+        val overallSuccessRate = if (totalCount > 0) (successCount.toDouble() / totalCount) * 100 else 0.0
+        val top1Rate = if (totalCount > 0) (top1Count.toDouble() / totalCount) * 100 else 0.0
+        val top2to5Rate = if (totalCount > 0) (top2to5Count.toDouble() / totalCount) * 100 else 0.0
+        val notFoundRate = if (totalCount > 0) (notFoundCount.toDouble() / totalCount) * 100 else 0.0
 
         reportBuilder.append("--------------------------------------------------\n")
-        reportBuilder.append(String.format("KEYBOARD EVALUATION REPORT Summary: %d out of %d tests succeeded. (%.2f%%)\n", successCount, totalCount, successRate))
+        reportBuilder.append("Summary:\n")
+        reportBuilder.append(String.format("  Overall Success Rate: %.2f%% (%d/%d)\n", overallSuccessRate, successCount, totalCount))
+        reportBuilder.append(String.format("  - Top 1 Match Rate:   %.2f%% (%d/%d)\n", top1Rate, top1Count, totalCount))
+        reportBuilder.append(String.format("  - Top 2-5 Match Rate: %.2f%% (%d/%d)\n", top2to5Rate, top2to5Count, totalCount))
+        reportBuilder.append(String.format("  - Not Found Rate:     %.2f%% (%d/%d)\n", notFoundRate, notFoundCount, totalCount))
         reportBuilder.append("================ END OF REPORT ================\n")
-        
+
         val report = reportBuilder.toString()
         Log.d(tag, "\n\n" + report)
 
@@ -139,10 +188,13 @@ class KeyboardEvaluationTest {
             Log.e(tag, "Failed to save test report.", e)
         }
 
-        val intent = Intent(MainActivity.TEST_FINISHED).apply {
-            putExtra(MainActivity.EXTRA_REPORT, report)
+        activityRule.scenario.onActivity {
+            it.setReportText(report)
         }
-        context.sendBroadcast(intent)
+
+        // The test will finish after this method, which closes the app.
+        // Add a long sleep to keep the app alive for inspection.
+        Thread.sleep(300000) // 5 minutes
     }
 
     private fun readTestData(): List<Pair<String, String>> {

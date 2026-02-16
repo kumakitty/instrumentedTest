@@ -1,51 +1,42 @@
 <?xml version="1.0" encoding="utf-8"?>
-<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:padding="16dp"
     tools:context=".MainActivity">
-
-    <TextView
-        android:id="@+id/app_title_text"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_alignParentTop="true"
-        android:layout_centerHorizontal="true"
-        android:text="@string/app_title"
-        android:textSize="20sp"
-        android:textStyle="bold" />
 
     <EditText
         android:id="@+id/evaluation_edit_text"
-        android:layout_width="match_parent"
+        android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:layout_below="@id/app_title_text"
+        android:layout_marginStart="16dp"
         android:layout_marginTop="16dp"
-        android:hint="Keyboard evaluation target..." />
+        android:layout_marginEnd="16dp"
+        android:hint="Pinyin will be entered here"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
 
     <ScrollView
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:layout_below="@id/evaluation_edit_text"
-        android:layout_above="@+id/start_test_button"
+        android:id="@+id/report_scroll_view"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
         android:layout_marginTop="16dp"
-        android:layout_marginBottom="16dp">
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/evaluation_edit_text">
 
         <TextView
             android:id="@+id/report_text_view"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:textAppearance="@style/TextAppearance.AppCompat.Body1"
-            android:textSize="12sp" />
+            android:padding="16dp"
+            android:textIsSelectable="true"
+            android:focusable="true"
+            android:longClickable="true"
+            android:text="" />
     </ScrollView>
 
-    <Button
-        android:id="@+id/start_test_button"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_alignParentBottom="true"
-        android:layout_centerHorizontal="true"
-        android:text="开始测试" />
-
-</RelativeLayout>
+</androidx.constraintlayout.widget.ConstraintLayout>
