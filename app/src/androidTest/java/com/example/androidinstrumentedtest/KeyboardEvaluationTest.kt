@@ -67,24 +67,32 @@ class KeyboardEvaluationTest {
         val editText = uiDevice.wait(Until.findObject(By.res(editTextResId)), 5000)
         assertNotNull("Evaluation edit text not found", editText)
 
+        // Click to focus and bring up the keyboard initially.
+        editText.click()
+        Thread.sleep(1000) // Wait for keyboard to appear
+
         testData.forEach { (pinyin, target) ->
             val result = EvaluationResult(pinyin, target)
             Log.d(tag, "--- Testing: pinyin='$pinyin', target='$target' ---")
 
             var foundMatch = false
             for (i in 1..MAX_CANDIDATES_TO_CHECK) {
-                // Type the pinyin sequence
+                // Ensure EditText is empty and focused for each attempt
                 editText.click()
                 editText.text = ""
-                Thread.sleep(100) // UI ready delay
+                Thread.sleep(100) // Wait for UI to settle after clearing
+
+                // Type the pinyin sequence char by char with delays
                 pinyin.forEach { char ->
                     val keyCode = getKeyCode(char)
-                    if (keyCode != -1) uiDevice.pressKeyCode(keyCode)
+                    if (keyCode != -1) {
+                        uiDevice.pressKeyCode(keyCode)
+                        Thread.sleep(50) // Delay between key presses
+                    }
                 }
                 Thread.sleep(500) // Wait for candidates to appear
 
                 // Navigate to the i-th candidate.
-                // For i=1, no move. For i=2, 1 right move, etc.
                 for (j in 1 until i) {
                     uiDevice.pressKeyCode(KeyEvent.KEYCODE_DPAD_RIGHT)
                     Thread.sleep(100)
@@ -191,6 +199,9 @@ class KeyboardEvaluationTest {
         activityRule.scenario.onActivity {
             it.setReportText(report)
         }
+
+        // Dismiss the keyboard before sleeping
+        uiDevice.pressBack()
 
         // The test will finish after this method, which closes the app.
         // Add a long sleep to keep the app alive for inspection.
