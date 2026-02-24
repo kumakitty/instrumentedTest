@@ -2,6 +2,9 @@ package com.example.androidinstrumentedtest
 
 import android.content.Intent
 import android.graphics.Color
+import android.os.Build
+import android.os.Environment
+import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
 import androidx.test.core.app.ApplicationProvider
@@ -152,8 +155,16 @@ class KeyboardEvaluationTest {
             return
         }
 
+        // Get device and IME info
+        val deviceModel = Build.MODEL
+        val imeId = Settings.Secure.getString(context.contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
+        val imeName = imeId?.split('/')?.get(0) ?: "Unknown IME"
+
         val reportBuilder = StringBuilder()
         reportBuilder.append("=========== KEYBOARD EVALUATION REPORT ============\n")
+        reportBuilder.append("Device: $deviceModel\n")
+        reportBuilder.append("Input Method: $imeName\n")
+        reportBuilder.append("--------------------------------------------------\n")
         reportBuilder.append(String.format("%-4s | %-7s | %-15s | %-10s | %-10s | %-3s | %s\n",
             "No.", "Status", "Pinyin", "Target", "Selected", "Pos", "Message"))
         results.forEachIndexed { index, result ->
@@ -186,12 +197,13 @@ class KeyboardEvaluationTest {
 
         // Save the report to a file on the device
         try {
-            val dir = context.getExternalFilesDir(null)
-            if (dir != null) {
-                val reportFile = File(dir, "keyboard_evaluation_report.txt")
-                reportFile.writeText(report)
-                Log.i(tag, "Test report saved to: ${reportFile.absolutePath}")
+            val dir = File(Environment.getExternalStorageDirectory(), "InstrumentedTest")
+            if (!dir.exists()) {
+                dir.mkdirs()
             }
+            val reportFile = File(dir, "keyboard_evaluation_report.txt")
+            reportFile.writeText(report)
+            Log.i(tag, "Test report saved to: ${reportFile.absolutePath}")
         } catch (e: Exception) {
             Log.e(tag, "Failed to save test report.", e)
         }
