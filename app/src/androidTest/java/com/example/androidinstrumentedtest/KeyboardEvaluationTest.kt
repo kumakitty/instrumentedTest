@@ -59,12 +59,14 @@ class KeyboardEvaluationTest {
     fun runKeyboardEvaluation() {
         val testData = readTestData()
         if (testData.isEmpty()) {
-            Log.e(tag, "No test data found, aborting test.")
+            Log.e(tag, "Aborting test due to empty or unreadable test data.")
+            // Wait for a moment so the user can see the error message on the screen
+            Thread.sleep(10000)
             return
         }
 
         activityRule.scenario.onActivity {
-            it.setReportText("测试正在进行中...\n")
+            it.setReportText("测试正在进行中...\n", Color.BLACK)
         }
 
         val editText = uiDevice.wait(Until.findObject(By.res(editTextResId)), 5000)
@@ -150,7 +152,7 @@ class KeyboardEvaluationTest {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         if (results.isEmpty()) {
             activityRule.scenario.onActivity {
-                it.setReportText("No results to display.")
+                it.setReportText("No results to display.", Color.BLACK)
             }
             return
         }
@@ -197,7 +199,7 @@ class KeyboardEvaluationTest {
 
         // Save the report to a file on the device
         try {
-            val dir = File(Environment.getExternalStorageDirectory(), "InstrumentedTest")
+            val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "InstrumentedTest")
             if (!dir.exists()) {
                 dir.mkdirs()
             }
@@ -209,7 +211,7 @@ class KeyboardEvaluationTest {
         }
 
         activityRule.scenario.onActivity {
-            it.setReportText(report)
+            it.setReportText(report, Color.BLACK)
         }
 
         // Dismiss the keyboard before sleeping
@@ -222,18 +224,53 @@ class KeyboardEvaluationTest {
 
     private fun readTestData(): List<Pair<String, String>> {
         val testData = mutableListOf<Pair<String, String>>()
-        val fileName = "26_weijianpin.txt"
+        val dataDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "InstrumentedTest")
+
+        if (!dataDir.exists() || dataDir.listFiles()?.isEmpty() == true) {
+            val errorMessage = "错误：未在设备上找到测试数据。请先返回主应用，点击‘导入数据’按钮导入文件。"
+            Log.e(tag, errorMessage)
+            activityRule.scenario.onActivity {
+                it.setReportText(errorMessage, Color.RED)
+            }
+            return testData
+        }
+
+        // Find the first file that is not the report file.
+        val testFile = dataDir.listFiles()?.firstOrNull { it.name != "keyboard_evaluation_report.txt" }
+
+        if (testFile == null) {
+            val errorMessage = "错误：在导入目录中未找到测试数据文件。请先返回主应用导入文件。"
+            Log.e(tag, errorMessage)
+            activityRule.scenario.onActivity {
+                it.setReportText(errorMessage, Color.RED)
+            }
+            return testData
+        }
+
+        Log.i(tag, "Reading test data from: ${testFile.absolutePath}")
         try {
-            val inputStream = InstrumentationRegistry.getInstrumentation().context.assets.open(fileName)
-            BufferedReader(InputStreamReader(inputStream)).forEachLine { line ->
+            BufferedReader(testFile.reader()).forEachLine { line ->
                 val parts = line.split('|')
                 if (parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank()) {
                     testData.add(Pair(parts[0].trim(), parts[1].trim()))
                 }
             }
         } catch (e: Exception) {
-            Log.e(tag, "Error reading test data file: $fileName", e)
+            Log.e(tag, "Error reading test data file: ${testFile.absolutePath}", e)
+            val errorMessage = "错误：读取测试数据文件时出错。"
+            activityRule.scenario.onActivity {
+                it.setReportText(errorMessage, Color.RED)
+            }
         }
+
+        if (testData.isEmpty()) {
+            val errorMessage = "错误：测试数据为空。请检查文件内容或确保已导入正确的文件。"
+            Log.e(tag, errorMessage)
+            activityRule.scenario.onActivity {
+                it.setReportText(errorMessage, Color.RED)
+            }
+        }
+
         return testData
     }
 
