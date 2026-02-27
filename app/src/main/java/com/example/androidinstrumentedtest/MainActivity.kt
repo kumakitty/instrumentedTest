@@ -6,9 +6,10 @@ import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
-import android.os.Environment
 import android.view.View
 import android.widget.Button
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -21,10 +22,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var reportTextView: TextView
     private lateinit var reportScrollView: ScrollView
     private lateinit var importDataButton: Button
+    private lateinit var testTypeRadioGroup: RadioGroup
 
     companion object {
         const val EXTRA_IS_TEST_MODE = "is_test_mode"
         private const val PICK_FILE_REQUEST_CODE = 1001
+        private const val TEST_DATA_FILENAME = "test_data.txt"
     }
 
     @SuppressLint("MissingInflatedId")
@@ -35,21 +38,37 @@ class MainActivity : AppCompatActivity() {
         reportTextView = findViewById(R.id.report_text_view)
         reportScrollView = findViewById(R.id.report_scroll_view)
         importDataButton = findViewById(R.id.import_data_button)
+        testTypeRadioGroup = findViewById(R.id.test_type_radio_group)
 
         val isTestMode = intent.getBooleanExtra(EXTRA_IS_TEST_MODE, false)
 
         if (isTestMode) {
-            // In test mode, UI is controlled by the test.
-            importDataButton.visibility = View.GONE // Hide the button during test runs
+            importDataButton.visibility = View.GONE
+            testTypeRadioGroup.visibility = View.GONE
         } else {
-            // In normal mode, allow user to import data.
-            reportTextView.text = "请点击按钮导入测试数据文件。"
+            findViewById<RadioButton>(R.id.radio_26_key).isChecked = true
+            updateImportPrompt(R.id.radio_26_key)
+
+            testTypeRadioGroup.setOnCheckedChangeListener { _, checkedId ->
+                updateImportPrompt(checkedId)
+            }
+
             importDataButton.setOnClickListener {
                 openFilePicker()
             }
         }
 
         Toast.makeText(this, "请先将输入法切换到中文输入法", Toast.LENGTH_LONG).show()
+    }
+
+    private fun updateImportPrompt(checkedId: Int) {
+        val promptText = if (checkedId == R.id.radio_26_key) {
+            "请导入26键测试数据文件（例如：pinyin|文字）"
+        } else {
+            "请导入9键测试数据文件（例如：1234|文字）"
+        }
+        reportTextView.text = promptText
+        reportTextView.setTextColor(Color.BLACK)
     }
 
     private fun openFilePicker() {
@@ -65,64 +84,34 @@ class MainActivity : AppCompatActivity() {
 
         if (requestCode == PICK_FILE_REQUEST_CODE && resultCode == Activity.RESULT_OK) {
             data?.data?.also { uri ->
-                copyDataToPublicDirectory(uri)
+                copyDataToAppDirectory(uri)
             }
         }
     }
 
-    private fun copyDataToPublicDirectory(uri: Uri) {
+    private fun copyDataToAppDirectory(uri: Uri) {
         try {
-            val dataDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "InstrumentedTest")
+            // Use internal storage for more reliability
+            val dataDir = File(filesDir, "InstrumentedTest")
             if (!dataDir.exists()) {
                 dataDir.mkdirs()
             }
 
-            // Extract original file name to use as the destination
-            val fileName = getFileName(uri) ?: "imported_test_data.txt"
-            val destinationFile = File(dataDir, fileName)
+            val destinationFile = File(dataDir, TEST_DATA_FILENAME)
 
-            // Clear the directory before copying the new file
-            dataDir.listFiles()?.forEach { it.delete() }
-
-            // Copy the selected file to the public directory
             contentResolver.openInputStream(uri)?.use { inputStream ->
-                FileOutputStream(destinationFile).use { outputStream ->
+                FileOutputStream(destinationFile).use { outputStream -> // This will overwrite the file if it exists
                     inputStream.copyTo(outputStream)
                 }
             }
 
-            val successMessage = "成功导入测试数据: '${destinationFile.name}'\n文件已保存至 'Documents/InstrumentedTest/' 目录。\n\n现在可以运行 'KeyboardEvaluationTest' 了。"
+            val successMessage = "成功导入测试数据: '${destinationFile.name}'\n文件已保存至 '${dataDir.absolutePath}' 目录。\n\n现在可以运行 'KeyboardEvaluationTest' 了。"
             setReportText(successMessage, Color.GREEN)
 
         } catch (e: Exception) {
             val errorMessage = "错误：导入文件失败。\n${e.message}"
             setReportText(errorMessage, Color.RED)
         }
-    }
-
-    @SuppressLint("Range")
-    private fun getFileName(uri: Uri): String? {
-        var result: String? = null
-        if (uri.scheme == "content") {
-            val cursor = contentResolver.query(uri, null, null, null, null)
-            try {
-                if (cursor != null && cursor.moveToFirst()) {
-                    result = cursor.getString(cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME))
-                }
-            } finally {
-                cursor?.close()
-            }
-        }
-        if (result == null) {
-            result = uri.path
-            val cut = result?.lastIndexOf('/')
-            if (cut != -1) {
-                if (cut != null) {
-                    result = result?.substring(cut + 1)
-                }
-            }
-        }
-        return result
     }
 
     fun setReportText(text: String, color: Int) {

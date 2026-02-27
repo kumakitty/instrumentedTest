@@ -36,6 +36,12 @@ plugins {
     buildFeatures {
         compose = true
     }
+
+    sourceSets {
+        getByName("androidTest") {
+            assets.srcDirs(file("src/androidTest/assets"))
+        }
+    }
 }
 
 java {

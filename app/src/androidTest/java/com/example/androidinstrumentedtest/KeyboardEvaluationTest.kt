@@ -1,9 +1,10 @@
 package com.example.androidinstrumentedtest
 
+import android.Manifest
+import android.app.Instrumentation
 import android.content.Intent
 import android.graphics.Color
 import android.os.Build
-import android.os.Environment
 import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
@@ -11,6 +12,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.rules.ActivityScenarioRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.rule.GrantPermissionRule
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
@@ -20,9 +22,6 @@ import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
-import java.io.BufferedReader
-import java.io.File
-import java.io.InputStreamReader
 
 // 定义一个数据类来存储每行的评测结果
 data class EvaluationResult(
@@ -44,36 +43,49 @@ class KeyboardEvaluationTest {
         }
     )
 
+    @get:Rule
+    val grantPermissionRule: GrantPermissionRule = GrantPermissionRule.grant(
+        Manifest.permission.READ_EXTERNAL_STORAGE,
+        Manifest.permission.WRITE_EXTERNAL_STORAGE
+    )
+
     private lateinit var uiDevice: UiDevice
+    private lateinit var instrumentation: Instrumentation
     private val results = mutableListOf<EvaluationResult>()
     private val tag = "KeyboardEvaluator"
     private val editTextResId = "com.example.androidinstrumentedtest:id/evaluation_edit_text"
     private val MAX_CANDIDATES_TO_CHECK = 5
+    private lateinit var testDataManager: TestDataManager
 
     @Before
     fun setup() {
-        uiDevice = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+        instrumentation = InstrumentationRegistry.getInstrumentation()
+        uiDevice = UiDevice.getInstance(instrumentation)
+        testDataManager = TestDataManager(instrumentation.targetContext)
     }
+
+    private fun findEditText() = uiDevice.findObject(By.res(editTextResId))
 
     @Test
     fun runKeyboardEvaluation() {
-        val testData = readTestData()
+        val testData = testDataManager.readTestData { errorMessage ->
+            activityRule.scenario.onActivity {
+                it.setReportText(errorMessage, Color.RED)
+            }
+        }
+
         if (testData.isEmpty()) {
             Log.e(tag, "Aborting test due to empty or unreadable test data.")
-            // Wait for a moment so the user can see the error message on the screen
-            Thread.sleep(10000)
             return
         }
 
         activityRule.scenario.onActivity {
-            it.setReportText("测试正在进行中...\n", Color.BLACK)
+            it.setReportText("测试正在进行中...", Color.BLACK)
         }
 
-        val editText = uiDevice.wait(Until.findObject(By.res(editTextResId)), 5000)
-        assertNotNull("Evaluation edit text not found", editText)
-
-        // Click to focus and bring up the keyboard initially.
-        editText.click()
+        uiDevice.wait(Until.findObject(By.res(editTextResId)), 5000)
+        
+        findEditText()?.click()
         Thread.sleep(1000) // Wait for keyboard to appear
 
         testData.forEach { (pinyin, target) ->
@@ -82,32 +94,37 @@ class KeyboardEvaluationTest {
 
             var foundMatch = false
             for (i in 1..MAX_CANDIDATES_TO_CHECK) {
-                // Ensure EditText is empty and focused for each attempt
-                editText.click()
-                editText.text = ""
-                Thread.sleep(100) // Wait for UI to settle after clearing
+                val currentEditText = findEditText()
+                assertNotNull("Evaluation edit text not found", currentEditText)
+                
+                currentEditText.click()
+                currentEditText.text = ""
 
-                // Type the pinyin sequence char by char with delays
                 pinyin.forEach { char ->
-                    val keyCode = getKeyCode(char)
-                    if (keyCode != -1) {
-                        uiDevice.pressKeyCode(keyCode)
-                        Thread.sleep(50) // Delay between key presses
+                    pressKey(char)
+                    Thread.sleep(50)
+                }
+
+                Thread.sleep(1500)
+                // 模拟输入方向向下键，展开输入法候选词
+                uiDevice.pressKeyCode(KeyEvent.KEYCODE_DPAD_DOWN)
+                Thread.sleep(300)
+                // 再模拟输入方向向上键，回到第一行候选词
+                uiDevice.pressKeyCode(KeyEvent.KEYCODE_DPAD_UP)
+                Thread.sleep(300)
+
+                // 选择候选词：第1个候选词默认按空格键，后续通过向右键移动后再按空格
+                if (i > 1) {
+                    repeat(i - 1) {
+                        uiDevice.pressKeyCode(KeyEvent.KEYCODE_DPAD_RIGHT)
+                        Thread.sleep(200)
                     }
                 }
-                Thread.sleep(500) // Wait for candidates to appear
-
-                // Navigate to the i-th candidate.
-                for (j in 1 until i) {
-                    uiDevice.pressKeyCode(KeyEvent.KEYCODE_DPAD_RIGHT)
-                    Thread.sleep(100)
-                }
-
-                // Select the candidate
                 uiDevice.pressKeyCode(KeyEvent.KEYCODE_SPACE)
-                Thread.sleep(200)
+                Thread.sleep(500) 
 
-                val currentSelection = editText.text.trim()
+                val resultEditText = findEditText()
+                val currentSelection = resultEditText?.text?.trim() ?: ""
 
                 if (currentSelection == target.trim()) {
                     result.selectedWord = currentSelection
@@ -116,10 +133,9 @@ class KeyboardEvaluationTest {
                     result.message = "Success: Matched target at candidate #$i."
                     Log.i(tag, result.message)
                     foundMatch = true
-                    break // Exit the candidate-checking loop
+                    break
                 } else {
-                    // If not matched, clear the edit text for the next attempt in the loop
-                    editText.text = ""
+                    findEditText()?.text = ""
                 }
             }
 
@@ -137,11 +153,11 @@ class KeyboardEvaluationTest {
 
     private fun sendPartialReport(result: EvaluationResult) {
         val status = if (result.wasFound) "SUCCESS" else "FAILURE"
-        val partialReport = String.format("%-7s | %-15s | %-10s | Pos: %-2d | %s\n",
-            status, result.pinyinSequence, result.targetWord, result.selectedNo, result.message)
-
+        val partialReport = String.format(
+            "%-7s | %-15s | %-10s | Pos: %-2d | %s",
+            status, result.pinyinSequence, result.targetWord, result.selectedNo, result.message
+        )
         val color = if (result.wasFound) Color.GREEN else Color.RED
-
         activityRule.scenario.onActivity {
             it.setReportText(partialReport, color)
         }
@@ -149,26 +165,23 @@ class KeyboardEvaluationTest {
 
     @After
     fun generateReport() {
-        val context = InstrumentationRegistry.getInstrumentation().targetContext
-        if (results.isEmpty()) {
-            activityRule.scenario.onActivity {
-                it.setReportText("No results to display.", Color.BLACK)
-            }
-            return
-        }
+        if (results.isEmpty()) return
 
-        // Get device and IME info
         val deviceModel = Build.MODEL
+        val context = instrumentation.targetContext
         val imeId = Settings.Secure.getString(context.contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
         val imeName = imeId?.split('/')?.get(0) ?: "Unknown IME"
+
+        val testMode = if (results.first().pinyinSequence.all { it.isDigit() }) "9-key" else "26-key"
 
         val reportBuilder = StringBuilder()
         reportBuilder.append("=========== KEYBOARD EVALUATION REPORT ============\n")
         reportBuilder.append("Device: $deviceModel\n")
         reportBuilder.append("Input Method: $imeName\n")
+        reportBuilder.append("Test Mode: $testMode\n")
         reportBuilder.append("--------------------------------------------------\n")
-        reportBuilder.append(String.format("%-4s | %-7s | %-15s | %-10s | %-10s | %-3s | %s\n",
-            "No.", "Status", "Pinyin", "Target", "Selected", "Pos", "Message"))
+        reportBuilder.append(String.format("%-4s | %-7s | %-15s | %-10s | %-10s | %-3s | %s\n", "No.", "Status", "Pinyin", "Target", "Selected", "Pos", "Message"))
+        
         results.forEachIndexed { index, result ->
             val status = if (result.wasFound) "SUCCESS" else "FAILURE"
             reportBuilder.append(String.format("%-4d | %-7s | %-15s | %-10s | %-10s | %-3d | %s\n",
@@ -178,7 +191,7 @@ class KeyboardEvaluationTest {
         val totalCount = results.size
         val successCount = results.count { it.wasFound }
         val top1Count = results.count { it.selectedNo == 1 }
-        val top2to5Count = results.count { it.selectedNo in 2..MAX_CANDIDATES_TO_CHECK }
+        val top2to5Count = results.count { it.selectedNo in 2..5 }
         val notFoundCount = results.count { it.selectedNo == 0 }
 
         val overallSuccessRate = if (totalCount > 0) (successCount.toDouble() / totalCount) * 100 else 0.0
@@ -195,87 +208,29 @@ class KeyboardEvaluationTest {
         reportBuilder.append("================ END OF REPORT ================\n")
 
         val report = reportBuilder.toString()
-        Log.d(tag, "\n\n" + report)
-
-        // Save the report to a file on the device
-        try {
-            val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "InstrumentedTest")
-            if (!dir.exists()) {
-                dir.mkdirs()
+        val reportFile = testDataManager.saveReport(report)
+        
+        if (reportFile != null) {
+            Log.i(tag, "测试报告已导出至: ${reportFile.absolutePath}")
+            activityRule.scenario.onActivity {
+                it.setReportText("测试完成！报告路径：\n${reportFile.absolutePath}", Color.BLUE)
             }
-            val reportFile = File(dir, "keyboard_evaluation_report.txt")
-            reportFile.writeText(report)
-            Log.i(tag, "Test report saved to: ${reportFile.absolutePath}")
-        } catch (e: Exception) {
-            Log.e(tag, "Failed to save test report.", e)
+        } else {
+            Log.e(tag, "保存测试报告失败")
         }
-
-        activityRule.scenario.onActivity {
-            it.setReportText(report, Color.BLACK)
-        }
-
-        // Dismiss the keyboard before sleeping
+        
         uiDevice.pressBack()
-
-        // The test will finish after this method, which closes the app.
-        // Add a long sleep to keep the app alive for inspection.
-        Thread.sleep(300000) // 5 minutes
     }
 
-    private fun readTestData(): List<Pair<String, String>> {
-        val testData = mutableListOf<Pair<String, String>>()
-        val dataDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "InstrumentedTest")
-
-        if (!dataDir.exists() || dataDir.listFiles()?.isEmpty() == true) {
-            val errorMessage = "错误：未在设备上找到测试数据。请先返回主应用，点击‘导入数据’按钮导入文件。"
-            Log.e(tag, errorMessage)
-            activityRule.scenario.onActivity {
-                it.setReportText(errorMessage, Color.RED)
-            }
-            return testData
+    private fun pressKey(key: Char) {
+        val keyCode = getKeyCode(key.lowercaseChar())
+        if (keyCode != -1) {
+            instrumentation.sendKeyDownUpSync(keyCode)
         }
-
-        // Find the first file that is not the report file.
-        val testFile = dataDir.listFiles()?.firstOrNull { it.name != "keyboard_evaluation_report.txt" }
-
-        if (testFile == null) {
-            val errorMessage = "错误：在导入目录中未找到测试数据文件。请先返回主应用导入文件。"
-            Log.e(tag, errorMessage)
-            activityRule.scenario.onActivity {
-                it.setReportText(errorMessage, Color.RED)
-            }
-            return testData
-        }
-
-        Log.i(tag, "Reading test data from: ${testFile.absolutePath}")
-        try {
-            BufferedReader(testFile.reader()).forEachLine { line ->
-                val parts = line.split('|')
-                if (parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank()) {
-                    testData.add(Pair(parts[0].trim(), parts[1].trim()))
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(tag, "Error reading test data file: ${testFile.absolutePath}", e)
-            val errorMessage = "错误：读取测试数据文件时出错。"
-            activityRule.scenario.onActivity {
-                it.setReportText(errorMessage, Color.RED)
-            }
-        }
-
-        if (testData.isEmpty()) {
-            val errorMessage = "错误：测试数据为空。请检查文件内容或确保已导入正确的文件。"
-            Log.e(tag, errorMessage)
-            activityRule.scenario.onActivity {
-                it.setReportText(errorMessage, Color.RED)
-            }
-        }
-
-        return testData
     }
 
     private fun getKeyCode(char: Char): Int {
-        return when (char.lowercaseChar()) {
+        return when (char) {
             'a' -> KeyEvent.KEYCODE_A
             'b' -> KeyEvent.KEYCODE_B
             'c' -> KeyEvent.KEYCODE_C
@@ -302,7 +257,17 @@ class KeyboardEvaluationTest {
             'x' -> KeyEvent.KEYCODE_X
             'y' -> KeyEvent.KEYCODE_Y
             'z' -> KeyEvent.KEYCODE_Z
-            else -> -1 // Invalid character
+            '0' -> KeyEvent.KEYCODE_0
+            '1' -> KeyEvent.KEYCODE_1
+            '2' -> KeyEvent.KEYCODE_2
+            '3' -> KeyEvent.KEYCODE_3
+            '4' -> KeyEvent.KEYCODE_4
+            '5' -> KeyEvent.KEYCODE_5
+            '6' -> KeyEvent.KEYCODE_6
+            '7' -> KeyEvent.KEYCODE_7
+            '8' -> KeyEvent.KEYCODE_8
+            '9' -> KeyEvent.KEYCODE_9
+            else -> -1
         }
     }
 }
