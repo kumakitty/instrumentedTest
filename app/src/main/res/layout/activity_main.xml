@@ -48,10 +48,22 @@
         android:layout_marginTop="8dp"
         android:text="导入测试数据"
         app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintHorizontal_bias="0.3"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintTop_toBottomOf="@+id/test_type_radio_group" />
 
-    <ScrollView
+    <Button
+        android:id="@+id/calibrate_button"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="开始校准"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintHorizontal_bias="0.7"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/test_type_radio_group" />
+
+    <com.example.androidinstrumentedtest.ScrollScrollView
         android:id="@+id/report_scroll_view"
         android:layout_width="0dp"
         android:layout_height="0dp"
@@ -70,6 +82,6 @@
             android:focusable="true"
             android:longClickable="true"
             android:text="" />
-    </ScrollView>
+    </com.example.androidinstrumentedtest.ScrollScrollView>
 
 </androidx.constraintlayout.widget.ConstraintLayout>
