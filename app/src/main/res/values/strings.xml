@@ -1,4 +1,5 @@
 <resources>
     <string name="app_name">KeyboardTest</string>
     <string name="app_title">中文输入法尾简拼自动评测程序</string>
+    <string name="report_content_description">测试报告内容</string>
 </resources>

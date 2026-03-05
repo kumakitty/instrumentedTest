@@ -13,6 +13,7 @@
         android:layout_marginStart="16dp"
         android:layout_marginTop="16dp"
         android:layout_marginEnd="16dp"
+        android:minHeight="48dp"
         android:hint="Pinyin will be entered here"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
@@ -32,12 +33,14 @@
             android:id="@+id/radio_26_key"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:minHeight="48dp"
             android:text="26键测试" />
 
         <RadioButton
             android:id="@+id/radio_9_key"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:minHeight="48dp"
             android:text="9键测试" />
     </RadioGroup>
 
@@ -81,6 +84,7 @@
             android:textIsSelectable="true"
             android:focusable="true"
             android:longClickable="true"
+            android:contentDescription="@string/report_content_description"
             android:text="" />
     </com.example.androidinstrumentedtest.ScrollScrollView>
 

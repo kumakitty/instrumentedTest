@@ -2,52 +2,33 @@ package com.example.androidinstrumentedtest
 
 import android.Manifest
 import android.app.Instrumentation
-import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Rect
+import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
-import androidx.test.core.app.ApplicationProvider
-import androidx.test.ext.junit.rules.ActivityScenarioRule
-import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.rule.ActivityTestRule
 import androidx.test.rule.GrantPermissionRule
-import androidx.test.uiautomator.By
-import androidx.test.uiautomator.UiDevice
-import androidx.test.uiautomator.Until
-import androidx.test.uiautomator.UiObject2
+import androidx.test.uiautomator.*
 import org.json.JSONObject
 import org.junit.After
-import org.junit.Assert.assertNotNull
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
-import org.junit.runner.RunWith
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
-// 评测结果数据类
-data class EvaluationResult(
-    val pinyinSequence: String,
-    val targetWord: String,
-    var selectedWord: String = "",
-    var wasFound: Boolean = false,
-    var selectedNo: Int = 0,
-    var message: String = "",
-    val attempts: MutableList<String> = mutableListOf()
-)
-
-@RunWith(AndroidJUnit4::class)
 class KeyboardEvaluationTest {
 
     @get:Rule
-    val activityRule: ActivityScenarioRule<MainActivity> = ActivityScenarioRule(
-        Intent(ApplicationProvider.getApplicationContext(), MainActivity::class.java).apply {
-            putExtra(MainActivity.EXTRA_IS_TEST_MODE, true)
-        }
-    )
+    val activityRule = ActivityTestRule(MainActivity::class.java, true, false)
 
     @get:Rule
     val grantPermissionRule: GrantPermissionRule = GrantPermissionRule.grant(
@@ -65,6 +46,7 @@ class KeyboardEvaluationTest {
     
     private var isNineKeyTest: Boolean = false
     private val manualPositions = mutableMapOf<String, Rect>()
+    private var lastManualPositionsJson: String = ""
 
     @Before
     fun setup() {
@@ -75,6 +57,12 @@ class KeyboardEvaluationTest {
         testDataManager = TestDataManager(instrumentation.targetContext)
         
         loadManualCalibrationData()
+        
+        activityRule.launchActivity(
+            Intent(instrumentation.targetContext, MainActivity::class.java).apply {
+                putExtra(MainActivity.EXTRA_IS_TEST_MODE, true)
+            }
+        )
     }
 
     private fun loadManualCalibrationData() {
@@ -83,16 +71,15 @@ class KeyboardEvaluationTest {
             val dataDir = File(mainAppContext.filesDir, "InstrumentedTest")
             val calibrationFile = File(dataDir, "calibration.json")
             if (calibrationFile.exists()) {
-                val json = JSONObject(calibrationFile.readText())
-                val keys = listOf("2", "3", "4", "5", "6", "7", "8", "9", "0", "dropdown_btn", 
-                                  "candidate_1", "candidate_2", "candidate_3", "candidate_4", "candidate_5")
+                lastManualPositionsJson = calibrationFile.readText()
+                val json = JSONObject(lastManualPositionsJson)
+                val keys = listOf("2", "3", "4", "5", "6", "7", "8", "9", "0", "dropdown_btn", "candidate_area")
                 keys.forEach { keyStr ->
                     if (json.has(keyStr)) {
                         val point = json.getJSONObject(keyStr)
                         val x = point.getDouble("x").toInt()
                         val y = point.getDouble("y").toInt()
                         manualPositions[keyStr] = Rect(x - 5, y - 5, x + 5, y + 5)
-                        Log.i(tag, "加载校准坐标成功: $keyStr -> ($x, $y)")
                     }
                 }
             }
@@ -106,15 +93,17 @@ class KeyboardEvaluationTest {
     private fun clearTextViaDelete(et: UiObject2?) {
         if (et == null) return
         et.click()
+        Thread.sleep(300)
         val text = et.text ?: ""
-        if (text.isNotEmpty() && text.uppercase() != "PINYIN WILL BE ENTERED HERE") {
-            repeat(text.length) { instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_DEL) }
-        }
+        val committedLen = if (text.isNotEmpty() && text.uppercase() != "PINYIN WILL BE ENTERED HERE") text.length else 0
+        repeat(committedLen) { instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_DEL); Thread.sleep(20) }
+        repeat(15) { instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_DEL); Thread.sleep(20) }
+        Thread.sleep(200)
     }
 
     private fun updateStatus(msg: String, color: Int = Color.BLACK) {
         Log.i(tag, msg)
-        activityRule.scenario.onActivity { activity: MainActivity -> activity.setReportText(msg, color) }
+        activityRule.activity.runOnUiThread { activityRule.activity.setReportText(msg, color) }
     }
 
     @Test
@@ -122,89 +111,116 @@ class KeyboardEvaluationTest {
         val testData = testDataManager.readTestData { errorMessage -> updateStatus(errorMessage, Color.RED) }
         if (testData.isEmpty()) return
 
-        isNineKeyTest = testData.firstOrNull()?.first?.all { it.isDigit() } == true
+        isNineKeyTest = testData.any { it.first.any { c -> c.isDigit() } }
         val initialET = findSafeEditText(5000) ?: return
         initialET.click(); Thread.sleep(1500)
 
-        updateStatus("评测开始 (${if (isNineKeyTest) "9键面板模式" else "26键模式"})...", Color.BLACK)
+        updateStatus("评测开始 (${if (isNineKeyTest) "9键模式" else "26键模式"})...", Color.BLACK)
 
-        testData.forEach { dataPair ->
+        testData.forEachIndexed { index, dataPair ->
             val pinyin = dataPair.first
             val target = dataPair.second
             val result = EvaluationResult(pinyin, target)
-            Log.i(tag, "--- 正在评测: 拼音序列 = $pinyin, 目标词 = $target ---")
+            Log.i(tag, ">>> [${index + 1}/${testData.size}] 评测中: $pinyin -> $target")
 
-            var foundMatch = false
-            for (i in 1..maxCandidatesToCheck) {
-                var currentPosSuccess = false
-                var retryCount = 0
-                val maxRetries = 1
-
-                while (!currentPosSuccess && retryCount <= maxRetries) {
-                    val et = findSafeEditText(2000) ?: return
-                    clearTextViaDelete(et)
-                    Thread.sleep(300); et.click(); Thread.sleep(200)
-
-                    pinyin.forEach { char: Char -> pressKeyInternal(char); Thread.sleep(100) }
-                    Thread.sleep(1000)
-
-                    if (isNineKeyTest) {
-                        // 1. 点击校准的下拉按钮展开面板
-                        val dropdown = manualPositions["dropdown_btn"]
-                        if (dropdown != null) {
-                            uiDevice.click(dropdown.centerX(), dropdown.centerY())
-                            Thread.sleep(800) // 等待展开动画
-                            
-                            // 2. 直接点击对应序号的候选词物理坐标
-                            val candidateKey = "candidate_$i"
-                            val pos = manualPositions[candidateKey]
-                            if (pos != null) {
-                                uiDevice.click(pos.centerX(), pos.centerY())
-                                Log.d(tag, "点击面板候选词: $candidateKey, 坐标: (${pos.centerX()}, ${pos.centerY()})")
-                            }
-                        }
-                    } else {
-                        if (i > 1) {
-                            repeat(i - 1) { instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_DPAD_RIGHT); Thread.sleep(200) }
-                        }
-                        instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_SPACE)
-                    }
-                    
-                    Thread.sleep(1000)
-                    val resultText = findSafeEditText(1000)?.text?.trim()?.toString() ?: ""
-                    val cleanResultText = if (resultText.uppercase().contains("PINYIN")) "" else resultText
-
-                    if (cleanResultText.isNotEmpty()) {
-                        currentPosSuccess = true
-                        result.attempts.add(cleanResultText)
-                        if (cleanResultText == target.trim()) {
-                            result.selectedWord = cleanResultText; result.wasFound = true; result.selectedNo = i; result.message = "Success."
-                            foundMatch = true; break
-                        } else { clearTextViaDelete(findSafeEditText(500)) }
-                    } else {
-                        retryCount++
-                        Log.w(tag, "候选词序位 $i 无词上屏，触发重试流程...")
-                        Thread.sleep(500)
-                    }
-                }
-                if (foundMatch) break
-                if (!currentPosSuccess) result.attempts.add("")
+            if (isNineKeyTest) {
+                run9KeyEvaluation(result, target, pinyin)
+            } else {
+                run26KeyEvaluation(result, target, pinyin)
             }
-            if (!foundMatch) result.wasFound = false
-            results.add(result); sendPartialReport(result)
+
+            results.add(result)
+            sendPartialReport(result)
+            
+            Thread.sleep(1200)
+        }
+    }
+
+    private fun run9KeyEvaluation(result: EvaluationResult, target: String, pinyin: String) {
+        try {
+            val et = findSafeEditText(2000) ?: return
+            clearTextViaDelete(et)
+            pinyin.forEach { char -> pressKeyInternal(char); Thread.sleep(120) }
+            Thread.sleep(1000)
+            manualPositions["0"]?.let { uiDevice.click(it.centerX(), it.centerY()) }
+            Thread.sleep(800)
+            val anchorWord = findSafeEditText(1000)?.text?.trim()?.toString() ?: ""
+            if (anchorWord.isEmpty()) { result.message = "ERROR: Anchor Empty"; return }
+
+            clearTextViaDelete(findSafeEditText(1000))
+            pinyin.forEach { char -> pressKeyInternal(char); Thread.sleep(120) }
+            Thread.sleep(800)
+            val dropdown = manualPositions["dropdown_btn"] ?: return
+            uiDevice.click(dropdown.centerX(), dropdown.centerY())
+            Thread.sleep(1800)
+
+            val cacheFile = File(instrumentation.targetContext.cacheDir, "panel_ocr.png")
+            if (cacheFile.exists()) cacheFile.delete()
+            uiDevice.takeScreenshot(cacheFile)
+            val screenshot = BitmapFactory.decodeFile(cacheFile.absolutePath)
+            
+            var allTokens = listOf<String>()
+            val latch = CountDownLatch(1)
+            activityRule.activity.runOnUiThread {
+                activityRule.activity.getAllOcrTokens(screenshot) { tokens ->
+                    allTokens = tokens; latch.countDown()
+                }
+            }
+            latch.await(15, TimeUnit.SECONDS)
+
+            val anchorIdx = allTokens.indexOfFirst { it == anchorWord }
+            if (anchorIdx != -1) {
+                val candidates = mutableListOf<String>()
+                candidates.add(allTokens[anchorIdx])
+                for (k in 1 until 5) { if (anchorIdx + k < allTokens.size) candidates.add(allTokens[anchorIdx + k]) }
+                
+                var matchedIdx = -1
+                candidates.forEachIndexed { i, word ->
+                    result.attempts.add(word)
+                    if (matchedIdx == -1 && word == target.trim()) matchedIdx = i
+                }
+
+                if (matchedIdx != -1) {
+                    result.selectedWord = candidates[matchedIdx]; result.wasFound = true
+                    result.selectedNo = matchedIdx + 1; result.message = "OCR Success"
+                } else { result.message = "Not in Top 5" }
+            } else { result.message = "NOT_FOUND: Anchor mismatch" }
+            
+            uiDevice.pressBack(); Thread.sleep(500)
+            clearTextViaDelete(findSafeEditText(500))
+        } catch (e: Exception) { Log.e(tag, "9键流程异常", e) }
+    }
+
+    private fun run26KeyEvaluation(result: EvaluationResult, target: String, pinyin: String) {
+        for (i in 1..maxCandidatesToCheck) {
+            val et = findSafeEditText(2000) ?: return
+            clearTextViaDelete(et)
+            pinyin.forEach { char -> pressKeyInternal(char); Thread.sleep(100) }
+            Thread.sleep(1000)
+            if (i > 1) { repeat(i - 1) { instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_DPAD_RIGHT); Thread.sleep(200) } }
+            instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_SPACE); Thread.sleep(1000)
+            val resText = findSafeEditText(1000)?.text?.trim()?.toString() ?: ""
+            val clean = if (resText.uppercase().contains("PINYIN")) "" else resText
+            result.attempts.add(clean)
+            if (clean == target.trim()) {
+                result.selectedWord = clean; result.wasFound = true; result.selectedNo = i; result.message = "Success"
+                return
+            }
         }
     }
 
     private fun sendPartialReport(result: EvaluationResult) {
-        val status = if (result.wasFound) "SUCCESS" else "FAILURE"
-        val report = String.format("%-7s | %-15s | %-10s | Pos: %-2d", status, result.pinyinSequence, result.targetWord, result.selectedNo)
-        activityRule.scenario.onActivity { activity: MainActivity -> activity.setReportText(report, if (result.wasFound) Color.GREEN else Color.RED) }
+        val status = if (result.wasFound) "SUCCESS" else "NOT_FOUND"
+        val report = String.format("%-9s | %-15s | %-10s | Pos: %-2d", status, result.pinyinSequence, result.targetWord, result.selectedNo)
+        Log.i(tag, "[ITEM RESULT] $report")
+        activityRule.activity.runOnUiThread {
+            activityRule.activity.setReportText(report, if (result.wasFound) Color.GREEN else Color.RED)
+        }
     }
 
     @After
     fun generateReport() {
         if (results.isEmpty()) return
-        
         val totalCount = results.size
         val top1Count = results.count { it.wasFound && it.selectedNo == 1 }
         val top2_5Count = results.count { it.wasFound && it.selectedNo in 2..5 }
@@ -217,31 +233,40 @@ class KeyboardEvaluationTest {
 
         val imeId = Settings.Secure.getString(instrumentation.targetContext.contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
         val imeName = imeId?.split('/')?.get(0) ?: "Unknown"
-        val testModeName = if (isNineKeyTest) "9-key Panel" else "26-key"
 
-        val sb = StringBuilder("=========== KEYBOARD EVALUATION REPORT ============\n")
-        sb.append("Device: ${Build.MODEL}\n")
-        sb.append("Input Method: $imeName\n")
-        sb.append("Test Mode: $testModeName\n")
+        val sb = StringBuilder("=========== FINAL EVALUATION REPORT ============\n")
+        sb.append("IME: $imeName | Mode: ${if (isNineKeyTest) "9-key" else "26-key"}\n")
         sb.append("--------------------------------------------------------------------------------\n")
-        sb.append(String.format("%-4s | %-7s | %-15s | %-10s | %-3s | %s\n", "No.", "Status", "Pinyin", "Target", "Pos", "Attempts"))
+        sb.append(String.format("%-4s | %-9s | %-15s | %-10s | %-3s | %s\n", "No.", "Status", "Pinyin", "Target", "Pos", "Attempts"))
         sb.append("--------------------------------------------------------------------------------\n")
-        
         results.forEachIndexed { idx, res ->
             val attemptsStr = res.attempts.joinToString(",")
-            sb.append(String.format("%-4d | %-7s | %-15s | %-10s | %-3d | %s\n",
-                idx + 1, if (res.wasFound) "SUCCESS" else "FAILURE", res.pinyinSequence, res.targetWord, res.selectedNo, attemptsStr))
+            sb.append(String.format("%-4d | %-9s | %-15s | %-10s | %-3d | %s\n",
+                idx + 1, if (res.wasFound) "SUCCESS" else "NOT_FOUND", res.pinyinSequence, res.targetWord, res.selectedNo, attemptsStr))
         }
-
         sb.append("--------------------------------------------------------------------------------\n")
-        sb.append("Summary:\n")
-        sb.append(String.format("  Overall Success Rate: %.2f%% (%d/%d)\n", overallRate, results.count { it.wasFound }, totalCount))
-        sb.append(String.format("  Top 1 Match Rate:     %.2f%% (%d/%d)\n", top1Rate, top1Count, totalCount))
-        sb.append(String.format("  Top 2-5 Match Rate:   %.2f%% (%d/%d)\n", top2_5Rate, top2_5Count, totalCount))
-        sb.append(String.format("  Not Found Rate:       %.2f%% (%d/%d)\n", notFoundRate, notFoundCount, totalCount))
+        sb.append(String.format("  Success Rate:   %.2f%% (%d/%d)\n", overallRate, results.count { it.wasFound }, totalCount))
+        sb.append(String.format("  Top 1 Rate:     %.2f%%\n", top1Rate))
+        sb.append(String.format("  Top 2-5 Rate:   %.2f%%\n", top2_5Rate))
+        sb.append(String.format("  Not Found Rate: %.2f%% (%d/%d)\n", notFoundRate, notFoundCount, totalCount))
         sb.append("================ END OF REPORT ================\n")
-
-        testDataManager.saveReport(sb.toString())
+        
+        val finalReport = sb.toString()
+        Log.i(tag, "\n" + finalReport)
+        val reportFile = testDataManager.saveReport(finalReport)
+        
+        // 自动使用系统默认文本查看器打开测试报告
+        if (reportFile != null && reportFile.exists()) {
+            try {
+                // 通过 adb shell am start 强制打开文件。这种方式在测试环境下非常直接且有效
+                val command = "am start -a android.intent.action.VIEW -d \"file://${reportFile.absolutePath}\" -t \"text/plain\""
+                uiDevice.executeShellCommand(command)
+                Log.i(tag, "已尝试打开报告文件: ${reportFile.absolutePath}")
+            } catch (e: Exception) {
+                Log.e(tag, "无法自动打开报告文件", e)
+            }
+        }
+        Thread.sleep(3000)
     }
 
     private fun pressKeyInternal(key: Char) {
@@ -252,7 +277,7 @@ class KeyboardEvaluationTest {
                 'j', 'k', 'l' -> "5"; 'm', 'n', 'o' -> "6"; 'p', 'q', 'r', 's' -> "7"
                 't', 'u', 'v' -> "8"; 'w', 'x', 'y', 'z' -> "9"; else -> keyChar.toString()
             }
-            manualPositions[targetKeyStr]?.let { uiDevice.click(it.centerX(), it.centerY()); Thread.sleep(100); return }
+            manualPositions[targetKeyStr]?.let { uiDevice.click(it.centerX(), it.centerY()); Thread.sleep(50); return }
         }
         val keyCode = when (keyChar) {
             'a'->KeyEvent.KEYCODE_A; 'b'->KeyEvent.KEYCODE_B; 'c'->KeyEvent.KEYCODE_C; 'd'->KeyEvent.KEYCODE_D
@@ -261,11 +286,19 @@ class KeyboardEvaluationTest {
             'm'->KeyEvent.KEYCODE_M; 'n'->KeyEvent.KEYCODE_N; 'o'->KeyEvent.KEYCODE_O; 'p'->KeyEvent.KEYCODE_P
             'q'->KeyEvent.KEYCODE_Q; 'r'->KeyEvent.KEYCODE_R; 's'->KeyEvent.KEYCODE_S; 't'->KeyEvent.KEYCODE_T
             'u'->KeyEvent.KEYCODE_U; 'v'->KeyEvent.KEYCODE_V; 'w'->KeyEvent.KEYCODE_W; 'x'->KeyEvent.KEYCODE_X
-            'y'->KeyEvent.KEYCODE_Y; 'z'->KeyEvent.KEYCODE_Z; '0'->KeyEvent.KEYCODE_0; '1'->KeyEvent.KEYCODE_1
-            '2'->KeyEvent.KEYCODE_2; '3'->KeyEvent.KEYCODE_3; '4'->KeyEvent.KEYCODE_4; '5'->KeyEvent.KEYCODE_5
-            '6'->KeyEvent.KEYCODE_6; '7'->KeyEvent.KEYCODE_7; '8'->KeyEvent.KEYCODE_8; '9'->KeyEvent.KEYCODE_9
+            'y'->KeyEvent.KEYCODE_Y; 'z'->KeyEvent.KEYCODE_Z; ' '->KeyEvent.KEYCODE_SPACE; '0','1','2','3','4','5','6','7','8','9'->(keyChar.code - '0'.code + KeyEvent.KEYCODE_0)
             else -> -1
         }
         if (keyCode != -1) instrumentation.sendKeyDownUpSync(keyCode)
     }
+
+    data class EvaluationResult(
+        val pinyinSequence: String,
+        val targetWord: String,
+        var wasFound: Boolean = false,
+        var selectedWord: String = "",
+        var selectedNo: Int = 0,
+        var attempts: MutableList<String> = mutableListOf(),
+        var message: String = ""
+    )
 }

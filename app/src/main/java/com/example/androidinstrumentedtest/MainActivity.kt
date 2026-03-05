@@ -23,10 +23,16 @@ import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
+import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
+import kotlin.math.pow
+import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity() {
 
@@ -38,12 +44,14 @@ class MainActivity : AppCompatActivity() {
     
     private var calibrationView: CalibrationCircleView? = null
     private var isCalibrating = false
+    private var isVerifying = false
     private var calibrationStep = 0
     
+    // 校准序列
     private val calibrationKeys = listOf(
         "2", "3", "4", "5", "6", "7", "8", "9", "0", 
         "dropdown_btn", 
-        "candidate_1", "candidate_2", "candidate_3", "candidate_4", "candidate_5"
+        "candidate_area"
     )
     private val calibrationPrompts = listOf(
         "请将红圈拖到 'ABC' (2键) 中心并确认",
@@ -56,11 +64,7 @@ class MainActivity : AppCompatActivity() {
         "请将红圈拖到 'WXYZ' (9键) 中心并确认",
         "请将红圈拖到 '空格' 键中心并确认",
         "请将红圈拖到 '候选词下拉按钮' 中心并确认",
-        "请展开全屏面板，并定位 '第1位候选词'",
-        "请定位展开面板中的 '第2位候选词'",
-        "请定位展开面板中的 '第3位候选词'",
-        "请定位展开面板中的 '第4位候选词'",
-        "请定位展开面板中的 '第5位候选词'"
+        "请使用红框圈出 '前5位候选词' 所在的区域 (可拖动右下角缩放) 并确认"
     )
 
     private val calibrationPointsJson = JSONObject()
@@ -69,6 +73,10 @@ class MainActivity : AppCompatActivity() {
 
     private var projectionManager: MediaProjectionManager? = null
     private var mediaProjection: MediaProjection? = null
+    
+    private val recognizer: TextRecognizer by lazy {
+        TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
+    }
 
     companion object {
         const val EXTRA_IS_TEST_MODE = "is_test_mode"
@@ -90,6 +98,9 @@ class MainActivity : AppCompatActivity() {
 
         projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
+        // 核心修复：启动时从本地加载校准数据
+        loadCalibrationData()
+
         if (intent.getBooleanExtra(EXTRA_IS_TEST_MODE, false)) {
             importDataButton.visibility = View.GONE
             calibrateButton.visibility = View.GONE
@@ -100,6 +111,57 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun loadCalibrationData() {
+        try {
+            val dir = File(filesDir, "InstrumentedTest")
+            val file = File(dir, "calibration.json")
+            if (file.exists()) {
+                val json = JSONObject(file.readText())
+                val keys = json.keys()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    calibrationPointsJson.put(key, json.get(key))
+                }
+                Log.i(TAG, "已加载本地校准配置")
+            }
+        } catch (e: Exception) { Log.e(TAG, "加载配置失败", e) }
+    }
+
+    /**
+     * 接口：获取面板上的候选词。程序会严格裁剪用户在校准时圈出的矩形区域，避免干扰。
+     */
+    fun getAllOcrTokens(screenshot: Bitmap, onResult: (List<String>) -> Unit) {
+        try {
+            val areaJson = calibrationPointsJson.optJSONObject("candidate_area")
+            val imageToProcess = if (areaJson != null) {
+                val cx = areaJson.getInt("x"); val cy = areaJson.getInt("y")
+                val w = areaJson.getInt("w"); val h = areaJson.getInt("h")
+                val left = Math.max(0, cx - w / 2)
+                val top = Math.max(0, cy - h / 2)
+                val cropW = Math.min(w, screenshot.width - left)
+                val cropH = Math.min(h, screenshot.height - top)
+                Log.i(TAG, "[OCR] 裁剪区域: ($left, $top, $cropW, $cropH)")
+                Bitmap.createBitmap(screenshot, left, top, cropW, cropH)
+            } else {
+                Log.w(TAG, "[OCR] 未发现裁剪区，将识别全屏 (可能被干扰)")
+                screenshot
+            }
+
+            val image = InputImage.fromBitmap(imageToProcess, 0)
+            recognizer.process(image).addOnSuccessListener { visionText ->
+                val allTokens = mutableListOf<String>()
+                // 按照从上到下、从左到右的顺序排列 OCR 文本块
+                val sortedBlocks = visionText.textBlocks.sortedWith(compareBy({ it.boundingBox?.top ?: 0 }, { it.boundingBox?.left ?: 0 }))
+                sortedBlocks.forEach { block ->
+                    val parts = block.text.split(Regex("[\\s\\n]+")).filter { it.isNotBlank() }
+                    allTokens.addAll(parts)
+                }
+                Log.i(TAG, "[OCR-Result] 识别到的词条: $allTokens")
+                onResult(allTokens)
+            }.addOnFailureListener { onResult(emptyList()) }
+        } catch (e: Exception) { onResult(emptyList()) }
+    }
+
     private fun requestScreenCapturePermission() {
         startMediaProjectionService()
         startActivityForResult(projectionManager!!.createScreenCaptureIntent(), SCREEN_CAPTURE_REQUEST_CODE)
@@ -107,18 +169,14 @@ class MainActivity : AppCompatActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == SCREEN_CAPTURE_REQUEST_CODE) {
-            if (resultCode == Activity.RESULT_OK && data != null) {
-                try {
-                    mediaProjection = projectionManager!!.getMediaProjection(resultCode, data)
-                    showStageGuide(1)
-                } catch (e: SecurityException) {
-                    Log.e(TAG, "MediaProjection Error: ${e.message}")
-                    stopMediaProjectionService()
-                }
+        if (requestCode == SCREEN_CAPTURE_REQUEST_CODE && resultCode == Activity.RESULT_OK && data != null) {
+            try {
+                mediaProjection = projectionManager!!.getMediaProjection(resultCode, data)
+                showStageGuide(1)
+            } catch (e: SecurityException) {
+                Log.e(TAG, "MediaProjection Error: ${e.message}")
+                stopMediaProjectionService()
             }
-        } else if (requestCode == PICK_FILE_REQUEST_CODE && resultCode == Activity.RESULT_OK) {
-            data?.data?.also { uri -> copyDataToAppDirectory(uri) }
         }
     }
 
@@ -133,15 +191,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun showStageGuide(stage: Int) {
         val title = if (stage == 1) "阶段1：主键盘校准" else "阶段2：全屏面板校准"
-        val msg = if (stage == 1) 
-            "1. 点击捕获后将拉起键盘。\n2. 请保持 9键数字 状态。\n3. 系统将截图进行按键和下拉按钮定位。" 
-            else "1. 点击捕获后将拉起键盘。\n2. 请手动点击下拉按钮展开全屏候选词面板。\n3. 系统将截图进行候选词位置定位。"
-
-        AlertDialog.Builder(this)
-            .setTitle(title).setMessage(msg)
+        val msg = if (stage == 1) "请保持9键状态，点击捕获截图。" else "请手动展开全屏面板，点击捕获截图。"
+        AlertDialog.Builder(this).setTitle(title).setMessage(msg)
             .setPositiveButton("立即捕获") { _, _ -> captureKeyboardAndStart(stage) }
-            .setNegativeButton("取消") { _, _ -> stopProjection() }
-            .setCancelable(false).show()
+            .setNegativeButton("取消") { _, _ -> stopProjection() }.setCancelable(false).show()
     }
 
     private fun captureKeyboardAndStart(stage: Int) {
@@ -149,35 +202,29 @@ class MainActivity : AppCompatActivity() {
         evaluationEditText.requestFocus()
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         imm.showSoftInput(evaluationEditText, InputMethodManager.SHOW_FORCED)
-
-        updateStatus(if (stage == 1) "正在准备主键盘快照..." else "正在准备全屏面板快照...", Color.BLACK)
-
         val rootView = window.decorView
         rootView.viewTreeObserver.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
             private var captured = false
             override fun onGlobalLayout() {
-                val rect = Rect()
-                rootView.getWindowVisibleDisplayFrame(rect)
-                val realMetrics = DisplayMetrics()
-                windowManager.defaultDisplay.getRealMetrics(realMetrics)
-                val screenHeight = realMetrics.heightPixels
-                
-                if ((screenHeight - rect.bottom) > screenHeight * 0.1) {
+                val rect = Rect(); rootView.getWindowVisibleDisplayFrame(rect)
+                val metrics = DisplayMetrics()
+                windowManager.defaultDisplay.getRealMetrics(metrics)
+                val realHeight = metrics.heightPixels
+                if ((realHeight - rect.bottom) > realHeight * 0.1) {
                     if (!captured) {
-                        captured = true
-                        rootView.viewTreeObserver.removeOnGlobalLayoutListener(this)
+                        captured = true; rootView.viewTreeObserver.removeOnGlobalLayoutListener(this)
                         evaluationEditText.postDelayed({
-                            val finalRect = Rect()
-                            rootView.getWindowVisibleDisplayFrame(finalRect)
-                            val top = finalRect.bottom
-                            
                             takeScreenshot { fullBitmap ->
                                 runOnUiThread {
-                                    val cropHeight = Math.min(fullBitmap.height - top, screenHeight - top)
+                                    val finalRect = Rect(); rootView.getWindowVisibleDisplayFrame(finalRect)
+                                    val top = finalRect.bottom
+                                    val windowBottom = rootView.height 
+                                    val cropHeight = Math.max(0, windowBottom - top)
+                                    
                                     keyboardSnapshot = if (cropHeight > 0) {
                                         Bitmap.createBitmap(fullBitmap, 0, top, fullBitmap.width, cropHeight)
                                     } else { fullBitmap }
-                                    keyboardSnapshotTop = if (cropHeight > 0) top else 0
+                                    keyboardSnapshotTop = top
                                     imm.hideSoftInputFromWindow(evaluationEditText.windowToken, 0)
                                     if (stage == 1) startCalibration() else resumeCalibrationAfterSnapshot()
                                 }
@@ -192,120 +239,122 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("WrongConstant")
     private fun takeScreenshot(callback: (Bitmap) -> Unit) {
         val projection = mediaProjection ?: return
-        val realMetrics = DisplayMetrics()
-        windowManager.defaultDisplay.getRealMetrics(realMetrics)
-        val w = realMetrics.widthPixels; val h = realMetrics.heightPixels; val d = realMetrics.densityDpi
+        val metrics = DisplayMetrics()
+        windowManager.defaultDisplay.getRealMetrics(metrics)
+        val w = metrics.widthPixels; val h = metrics.heightPixels; val d = metrics.densityDpi
 
         val localImageReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
         val snapshotThread = HandlerThread("SnapshotThread").apply { start() }
         val handler = Handler(snapshotThread.looper)
-
         val localVirtualDisplay = projection.createVirtualDisplay("Snapshot", w, h, d, 16, localImageReader.surface, null, handler)
         localImageReader.setOnImageAvailableListener({ reader ->
             val image = reader.acquireLatestImage()
             if (image != null) {
                 reader.setOnImageAvailableListener(null, null)
-                val planes = image.planes
-                val buffer = planes[0].buffer
-                val pixelStride = planes[0].pixelStride
-                val rowStride = planes[0].rowStride
+                val planes = image.planes; val buffer = planes[0].buffer
+                val pixelStride = planes[0].pixelStride; val rowStride = planes[0].rowStride
                 val rowPadding = rowStride - pixelStride * w
                 val bitmap = Bitmap.createBitmap(w + rowPadding / pixelStride, h, Bitmap.Config.ARGB_8888)
-                bitmap.copyPixelsFromBuffer(buffer)
-                image.close()
-                localVirtualDisplay?.release()
-                localImageReader.close()
-                snapshotThread.quitSafely()
+                bitmap.copyPixelsFromBuffer(buffer); image.close()
+                localVirtualDisplay?.release(); localImageReader.close(); snapshotThread.quitSafely()
                 callback(Bitmap.createBitmap(bitmap, 0, 0, w, h))
             }
         }, handler)
     }
 
     private fun startCalibration() {
-        isCalibrating = true
-        calibrationStep = 0
-        if (calibrationView == null) {
-            calibrationView = CalibrationCircleView(this)
-            addContentView(calibrationView, ViewGroup.LayoutParams(-1, -1))
-        }
-        calibrationView?.visibility = View.VISIBLE
-        resetPosition(); updatePrompt()
+        isCalibrating = true; calibrationStep = 0
+        if (calibrationView == null) { calibrationView = CalibrationCircleView(this); addContentView(calibrationView, ViewGroup.LayoutParams(-1, -1)) }
+        calibrationView?.visibility = View.VISIBLE; resetIndicatorPosition(); updatePrompt()
     }
 
     private fun resumeCalibrationAfterSnapshot() {
         calibrationView?.visibility = View.VISIBLE
-        resetPosition(); updatePrompt()
+        resetIndicatorPosition(); updatePrompt()
     }
 
-    private fun resetPosition() {
+    private fun resetIndicatorPosition() {
         keyboardSnapshot?.let { calibrationView?.setInitialPosition(it.width / 2f, keyboardSnapshotTop + it.height / 2f) }
     }
 
-    private fun updatePrompt() {
-        setReportText("校准中 (${calibrationStep + 1}/${calibrationKeys.size}):\n${calibrationPrompts[calibrationStep]}", Color.BLUE)
-    }
+    private fun updatePrompt() { setReportText("校准中 (${calibrationStep + 1}/${calibrationKeys.size}):\n${calibrationPrompts[calibrationStep]}", Color.BLUE) }
 
     private fun onCoordinateConfirmed(x: Float, y: Float) {
-        calibrationPointsJson.put(calibrationKeys[calibrationStep], JSONObject().apply { put("x", x.toDouble()); put("y", y.toDouble()) })
+        val key = calibrationKeys[calibrationStep]
+        val point = JSONObject().apply { put("x", x.toDouble()); put("y", y.toDouble()) }
+        if (key == "candidate_area") { calibrationView?.let { point.put("w", it.rectW.toDouble()); point.put("h", it.rectH.toDouble()) } }
+        calibrationPointsJson.put(key, point)
         calibrationStep++
-        if (calibrationStep == 10) {
-            calibrationView?.visibility = View.GONE
-            showStageGuide(2)
-        } else if (calibrationStep < calibrationKeys.size) {
-            resetPosition(); updatePrompt()
-        } else {
-            finishCalibration()
-        }
+        if (calibrationStep == 10) { calibrationView?.visibility = View.GONE; showStageGuide(2) } 
+        else if (calibrationStep < calibrationKeys.size) { resetIndicatorPosition(); updatePrompt() } 
+        else { finishCalibration() }
     }
 
     private fun finishCalibration() {
-        isCalibrating = false
-        calibrationView?.visibility = View.GONE
+        isCalibrating = false; calibrationView?.visibility = View.GONE
         try {
             val dir = File(filesDir, "InstrumentedTest").apply { if (!exists()) mkdirs() }
-            val file = File(dir, "calibration.json")
-            FileOutputStream(file).use { it.write(calibrationPointsJson.toString().toByteArray()) }
-            setReportText("✅ 校准成功！所有坐标已锁定。", Color.parseColor("#006400"))
-        } catch (e: Exception) { Log.e(TAG, "Save Error: ${e.message}") }
+            val file = File(dir, "calibration.json"); FileOutputStream(file).use { it.write(calibrationPointsJson.toString().toByteArray()) }
+            setReportText("✅ 校准成功！区域已锁定。", Color.parseColor("#006400"))
+        } catch (e: Exception) { Log.e(TAG, "Save Error", e) }
         stopProjection()
     }
 
-    private fun stopProjection() {
-        mediaProjection?.stop(); mediaProjection = null
-        stopMediaProjectionService()
-    }
-
+    private fun stopProjection() { mediaProjection?.stop(); mediaProjection = null; stopMediaProjectionService() }
     private fun updateStatus(msg: String, color: Int) { runOnUiThread { setReportText(msg, color) } }
 
     private inner class CalibrationCircleView(context: Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.RED; style = Paint.Style.STROKE; strokeWidth = 6f }
         private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(80, 255, 0, 0); style = Paint.Style.FILL }
         private var circleX = 0f; private var circleY = 0f
+        var rectW = 600f; var rectH = 120f
+        private var isDragging = false; private var isResizing = false
+
         fun setInitialPosition(sx: Float, sy: Float) { circleX = sx; circleY = sy; invalidate() }
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             val loc = IntArray(2); getLocationOnScreen(loc)
             if (isCalibrating) { keyboardSnapshot?.let { canvas.drawBitmap(it, -loc[0].toFloat(), (keyboardSnapshotTop - loc[1]).toFloat(), null) } }
             val dx = circleX - loc[0]; val dy = circleY - loc[1]
-            canvas.drawCircle(dx, dy, 70f, fillPaint); canvas.drawCircle(dx, dy, 70f, paint)
+            if (calibrationStep == 10) {
+                val left = dx - rectW/2; val top = dy - rectH/2; val right = dx + rectW/2; val bottom = dy + rectH/2
+                canvas.drawRect(left, top, right, bottom, fillPaint); canvas.drawRect(left, top, right, bottom, paint)
+                canvas.drawCircle(right, bottom, 25f, paint); canvas.drawCircle(right, bottom, 15f, fillPaint)
+            } else { canvas.drawCircle(dx, dy, 70f, fillPaint); canvas.drawCircle(dx, dy, 70f, paint) }
             canvas.drawLine(dx-35, dy, dx+35, dy, paint); canvas.drawLine(dx, dy-35, dx, dy+35, paint)
         }
-        @SuppressLint("ClickableViewAccessibility")
         override fun onTouchEvent(e: MotionEvent): Boolean {
             if (!isCalibrating) return false
-            if (e.action == MotionEvent.ACTION_UP) { performClick(); showConfirmDialog(circleX, circleY) } 
-            else { circleX = e.rawX; circleY = e.rawY; invalidate() }
+            val sx = e.rawX; val sy = e.rawY
+            val loc = IntArray(2); getLocationOnScreen(loc)
+            val vx = sx - loc[0]; val vy = sy - loc[1]
+            val cx = circleX - loc[0]; val cy = circleY - loc[1]
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    if (calibrationStep == 10) {
+                        val hX = cx + rectW/2; val hY = cy + rectH/2
+                        if (sqrt((vx-hX).pow(2) + (vy-hY).pow(2)) < 60) { isResizing = true; return true }
+                    }
+                    isDragging = true; circleX = sx; circleY = sy; invalidate()
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (isResizing) { rectW = Math.max(100f, (vx - cx) * 2); rectH = Math.max(60f, (vy - cy) * 2) }
+                    else if (isDragging) { circleX = sx; circleY = sy }
+                    invalidate()
+                }
+                MotionEvent.ACTION_UP -> { isDragging = false; isResizing = false; performClick(); showConfirmDialog(circleX, circleY) }
+            }
             return true
         }
         override fun performClick(): Boolean { super.performClick(); return true }
         private fun showConfirmDialog(sx: Float, sy: Float) {
-            val label = when { calibrationStep == 9 -> "下拉按钮"; calibrationStep >= 10 -> "第${calibrationStep - 9}候选词"; else -> calibrationKeys[calibrationStep] }
-            AlertDialog.Builder(context).setTitle("确认").setMessage("确认红圈对准了 '$label' 吗？").setPositiveButton("确定") { _, _ -> onCoordinateConfirmed(sx, sy) }.setNegativeButton("微调", null).show()
+            val label = if (calibrationStep == 9) "下拉按钮" else if (calibrationStep == 10) "候选词区域" else calibrationKeys[calibrationStep]
+            AlertDialog.Builder(context).setTitle("确认").setMessage("对准 '$label' 了吗？").setPositiveButton("确定") { _, _ -> onCoordinateConfirmed(sx, sy) }.setNegativeButton("微调", null).show()
         }
     }
-
     fun setReportText(text: String, color: Int) { runOnUiThread { reportTextView.text = text; reportTextView.setTextColor(color); reportScrollView.post { reportScrollView.fullScroll(View.FOCUS_DOWN) } } }
     private fun openFilePicker() { startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "text/*" }, PICK_FILE_REQUEST_CODE) }
-    private fun copyDataToAppDirectory(uri: Uri) { try { val dataDir = File(filesDir, "InstrumentedTest"); if (!dataDir.exists()) dataDir.mkdirs(); contentResolver.openInputStream(uri)?.use { i -> FileOutputStream(File(dataDir, "test_data.txt")).use { o -> i.copyTo(o) } }; setReportText("导入成功", Color.parseColor("#006400")) } catch (e: Exception) { setReportText("失败: ${e.message}", Color.RED) } }
+    private fun copyDataToAppDirectory(uri: Uri) { try { val dir = File(filesDir, "InstrumentedTest").apply { if (!exists()) mkdirs() }; contentResolver.openInputStream(uri)?.use { i -> FileOutputStream(File(dir, "test_data.txt")).use { o -> i.copyTo(o) } }; setReportText("导入成功", Color.parseColor("#006400")) } catch (e: Exception) { setReportText("失败: ${e.message}", Color.RED) } }
 }
+
 class ScrollScrollView(context: Context, attrs: android.util.AttributeSet? = null) : ScrollView(context, attrs)
