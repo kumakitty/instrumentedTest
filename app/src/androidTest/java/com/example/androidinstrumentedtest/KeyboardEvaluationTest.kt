@@ -122,9 +122,7 @@ class KeyboardEvaluationTest {
             val target = dataPair.second
             val result = EvaluationResult(pinyin, target)
             
-            // 更新正在测试的中间状态
             updateTestingStatus(pinyin, target)
-            
             Log.i(tag, ">>> [${index + 1}/${testData.size}] 评测中: $pinyin -> $target")
 
             if (isNineKeyTest) {
@@ -135,7 +133,6 @@ class KeyboardEvaluationTest {
 
             results.add(result)
             sendPartialReport(result) 
-            
             Thread.sleep(1200)
         }
     }
@@ -225,9 +222,7 @@ class KeyboardEvaluationTest {
         val prevText = prev?.let { "【前次结果】\n${formatResult(it)}" } ?: "【前次结果】\n等待中..."
         val currText = "【正在测试】\n$pinyin -> $target ..."
         val fullText = "$prevText\n\n$currText"
-        activityRule.activity.runOnUiThread {
-            activityRule.activity.setReportText(fullText, Color.DKGRAY)
-        }
+        activityRule.activity.runOnUiThread { activityRule.activity.setReportText(fullText, Color.DKGRAY) }
     }
 
     private fun sendPartialReport(result: EvaluationResult) {
@@ -235,7 +230,6 @@ class KeyboardEvaluationTest {
         val prevText = prev?.let { "【前次结果】\n${formatResult(it)}" } ?: ""
         val currText = "【当前结果】\n${formatResult(result)}"
         val fullReport = if (prevText.isNotEmpty()) "$prevText\n\n$currText" else currText
-        
         Log.i(tag, "[ITEM RESULT] ${result.pinyinSequence} -> ${result.targetWord} | ${if(result.wasFound) "SUCCESS" else "NOT_FOUND"}")
         activityRule.activity.runOnUiThread {
             val color = if (result.wasFound) Color.parseColor("#006400") else Color.RED
@@ -277,17 +271,18 @@ class KeyboardEvaluationTest {
         sb.append("================ END OF REPORT ================\n")
         
         val finalReport = sb.toString()
-        Log.i(tag, "\n" + finalReport)
         val reportFile = testDataManager.saveReport(finalReport)
         
         if (reportFile != null && reportFile.exists()) {
             try {
-                val command = "am start -a android.intent.action.VIEW -d \"file://${reportFile.absolutePath}\" -t \"text/plain\""
-                uiDevice.executeShellCommand(command)
-                Log.i(tag, "已尝试打开报告文件: ${reportFile.absolutePath}")
+                // 核心策略：通过 shell 指令强制调起文件查看器，并休眠确保 Intent 发出
+                val viewCmd = "am start -a android.intent.action.VIEW -d \"file://${reportFile.absolutePath}\" -t \"text/plain\""
+                uiDevice.executeShellCommand(viewCmd)
+                Log.i(tag, "测试完成，已尝试自动打开报告: ${reportFile.absolutePath}")
             } catch (e: Exception) { Log.e(tag, "无法自动打开报告文件", e) }
         }
-        Thread.sleep(3000)
+        // 重要：休眠 5 秒，防止测试进程立即退出导致应用无法切换
+        Thread.sleep(5000)
     }
 
     private fun pressKeyInternal(key: Char) {
