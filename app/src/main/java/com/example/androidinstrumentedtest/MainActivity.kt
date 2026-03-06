@@ -177,6 +177,8 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "MediaProjection Error: ${e.message}")
                 stopMediaProjectionService()
             }
+        } else if (requestCode == PICK_FILE_REQUEST_CODE && resultCode == Activity.RESULT_OK && data != null) {
+            data.data?.let { uri -> copyDataToAppDirectory(uri) }
         }
     }
 
@@ -353,8 +355,39 @@ class MainActivity : AppCompatActivity() {
         }
     }
     fun setReportText(text: String, color: Int) { runOnUiThread { reportTextView.text = text; reportTextView.setTextColor(color); reportScrollView.post { reportScrollView.fullScroll(View.FOCUS_DOWN) } } }
-    private fun openFilePicker() { startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "text/*" }, PICK_FILE_REQUEST_CODE) }
-    private fun copyDataToAppDirectory(uri: Uri) { try { val dir = File(filesDir, "InstrumentedTest").apply { if (!exists()) mkdirs() }; contentResolver.openInputStream(uri)?.use { i -> FileOutputStream(File(dir, "test_data.txt")).use { o -> i.copyTo(o) } }; setReportText("导入成功", Color.parseColor("#006400")) } catch (e: Exception) { setReportText("失败: ${e.message}", Color.RED) } }
+    private fun openFilePicker() { 
+        Log.i(TAG, "正在打开文件选择器...")
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "text/*" }, PICK_FILE_REQUEST_CODE) 
+    }
+    private fun copyDataToAppDirectory(uri: Uri) { 
+        try { 
+            Log.i(TAG, "正在从 URI 复制数据: $uri")
+            val dir = File(filesDir, "InstrumentedTest").apply { if (!exists()) mkdirs() }
+            val targetFile = File(dir, "test_data.txt")
+            
+            contentResolver.openInputStream(uri)?.use { i -> 
+                FileOutputStream(targetFile).use { o -> i.copyTo(o) } 
+            }
+            
+            val fileSize = targetFile.length()
+            Log.i(TAG, "文件已成功导入。路径: ${targetFile.absolutePath}, 大小: $fileSize bytes")
+            
+            // 预览文件前几行，确保格式正确
+            val preview = targetFile.bufferedReader().useLines { lines ->
+                lines.take(3).joinToString("\n")
+            }
+            Log.i(TAG, "文件内容预览 (前3行):\n$preview")
+
+            if (fileSize == 0L) {
+                setReportText("⚠️ 导入的文件似乎是空的！", Color.RED)
+            } else {
+                setReportText("✅ 导入成功！\n大小: $fileSize 字节\n预览:\n$preview", Color.parseColor("#006400")) 
+            }
+        } catch (e: Exception) { 
+            Log.e(TAG, "文件导入失败", e)
+            setReportText("❌ 失败: ${e.message}", Color.RED) 
+        } 
+    }
 }
 
 class ScrollScrollView(context: Context, attrs: android.util.AttributeSet? = null) : ScrollView(context, attrs)
