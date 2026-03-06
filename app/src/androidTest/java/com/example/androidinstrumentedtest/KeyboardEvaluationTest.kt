@@ -121,6 +121,10 @@ class KeyboardEvaluationTest {
             val pinyin = dataPair.first
             val target = dataPair.second
             val result = EvaluationResult(pinyin, target)
+            
+            // 更新正在测试的中间状态
+            updateTestingStatus(pinyin, target)
+            
             Log.i(tag, ">>> [${index + 1}/${testData.size}] 评测中: $pinyin -> $target")
 
             if (isNineKeyTest) {
@@ -130,7 +134,7 @@ class KeyboardEvaluationTest {
             }
 
             results.add(result)
-            sendPartialReport(result)
+            sendPartialReport(result) 
             
             Thread.sleep(1200)
         }
@@ -209,12 +213,33 @@ class KeyboardEvaluationTest {
         }
     }
 
-    private fun sendPartialReport(result: EvaluationResult) {
-        val status = if (result.wasFound) "SUCCESS" else "NOT_FOUND"
-        val report = String.format("%-9s | %-15s | %-10s | Pos: %-2d", status, result.pinyinSequence, result.targetWord, result.selectedNo)
-        Log.i(tag, "[ITEM RESULT] $report")
+    private fun formatResult(res: EvaluationResult): String {
+        val status = if (res.wasFound) "SUCCESS" else "NOT_FOUND"
+        val candidates = if (res.attempts.isEmpty()) "无" else res.attempts.take(5).joinToString(" | ")
+        return String.format("%s | %s -> %s | Pos: %d\n候选词: [%s]",
+            status, res.pinyinSequence, res.targetWord, res.selectedNo, candidates)
+    }
+
+    private fun updateTestingStatus(pinyin: String, target: String) {
+        val prev = results.lastOrNull()
+        val prevText = prev?.let { "【前次结果】\n${formatResult(it)}" } ?: "【前次结果】\n等待中..."
+        val currText = "【正在测试】\n$pinyin -> $target ..."
+        val fullText = "$prevText\n\n$currText"
         activityRule.activity.runOnUiThread {
-            activityRule.activity.setReportText(report, if (result.wasFound) Color.GREEN else Color.RED)
+            activityRule.activity.setReportText(fullText, Color.DKGRAY)
+        }
+    }
+
+    private fun sendPartialReport(result: EvaluationResult) {
+        val prev = results.getOrNull(results.size - 2)
+        val prevText = prev?.let { "【前次结果】\n${formatResult(it)}" } ?: ""
+        val currText = "【当前结果】\n${formatResult(result)}"
+        val fullReport = if (prevText.isNotEmpty()) "$prevText\n\n$currText" else currText
+        
+        Log.i(tag, "[ITEM RESULT] ${result.pinyinSequence} -> ${result.targetWord} | ${if(result.wasFound) "SUCCESS" else "NOT_FOUND"}")
+        activityRule.activity.runOnUiThread {
+            val color = if (result.wasFound) Color.parseColor("#006400") else Color.RED
+            activityRule.activity.setReportText(fullReport, color)
         }
     }
 
@@ -255,16 +280,12 @@ class KeyboardEvaluationTest {
         Log.i(tag, "\n" + finalReport)
         val reportFile = testDataManager.saveReport(finalReport)
         
-        // 自动使用系统默认文本查看器打开测试报告
         if (reportFile != null && reportFile.exists()) {
             try {
-                // 通过 adb shell am start 强制打开文件。这种方式在测试环境下非常直接且有效
                 val command = "am start -a android.intent.action.VIEW -d \"file://${reportFile.absolutePath}\" -t \"text/plain\""
                 uiDevice.executeShellCommand(command)
                 Log.i(tag, "已尝试打开报告文件: ${reportFile.absolutePath}")
-            } catch (e: Exception) {
-                Log.e(tag, "无法自动打开报告文件", e)
-            }
+            } catch (e: Exception) { Log.e(tag, "无法自动打开报告文件", e) }
         }
         Thread.sleep(3000)
     }

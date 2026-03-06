@@ -40,6 +40,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var reportScrollView: ScrollScrollView
     private lateinit var importDataButton: Button
     private lateinit var calibrateButton: Button
+    private lateinit var startTestButton: Button
     private lateinit var evaluationEditText: EditText
     
     private var calibrationView: CalibrationCircleView? = null
@@ -94,6 +95,7 @@ class MainActivity : AppCompatActivity() {
         reportScrollView = findViewById(R.id.report_scroll_view)
         importDataButton = findViewById(R.id.import_data_button)
         calibrateButton = findViewById(R.id.calibrate_button)
+        startTestButton = findViewById(R.id.start_test_button)
         evaluationEditText = findViewById(R.id.evaluation_edit_text)
 
         projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -104,10 +106,34 @@ class MainActivity : AppCompatActivity() {
         if (intent.getBooleanExtra(EXTRA_IS_TEST_MODE, false)) {
             importDataButton.visibility = View.GONE
             calibrateButton.visibility = View.GONE
+            startTestButton.visibility = View.GONE
             findViewById<View>(R.id.test_type_radio_group).visibility = View.GONE
         } else {
             importDataButton.setOnClickListener { openFilePicker() }
             calibrateButton.setOnClickListener { requestScreenCapturePermission() }
+            startTestButton.setOnClickListener { runInstrumentationTest() }
+        }
+    }
+
+    private fun runInstrumentationTest() {
+        val cmd = "am instrument -w com.example.androidinstrumentedtest.test/androidx.test.runner.AndroidJUnitRunner"
+        Log.i(TAG, "正在启动测试: $cmd")
+        try {
+            // 注意：直接在普通 App 中执行 am instrument 需要 root 权限或特定的系统签名。
+            // 这里我们尝试通过 Runtime 执行，但在非 root 设备上通常会失败。
+            // 更好的做法是提示用户在 PC 端运行该命令，或者通过 Shell 脚本触发。
+            val process = Runtime.getRuntime().exec(cmd)
+            Thread {
+                val reader = process.inputStream.bufferedReader()
+                var line: String?
+                while (reader.readLine().also { line = it } != null) {
+                    Log.d(TAG, "[Test Output] $line")
+                }
+            }.start()
+            setReportText("🚀 已尝试启动测试。请查看 Logcat 获取详细输出。", Color.BLUE)
+        } catch (e: Exception) {
+            Log.e(TAG, "启动测试失败", e)
+            setReportText("❌ 启动失败: ${e.message}\n请尝试在 ADB 中手动运行该命令。", Color.RED)
         }
     }
 
@@ -297,6 +323,7 @@ class MainActivity : AppCompatActivity() {
         try {
             val dir = File(filesDir, "InstrumentedTest").apply { if (!exists()) mkdirs() }
             val file = File(dir, "calibration.json"); FileOutputStream(file).use { it.write(calibrationPointsJson.toString().toByteArray()) }
+            Log.i(TAG, "[校准文件] 校准流程完成，坐标已自动保存: ${file.absolutePath}")
             setReportText("✅ 校准成功！区域已锁定。", Color.parseColor("#006400"))
         } catch (e: Exception) { Log.e(TAG, "Save Error", e) }
         stopProjection()
@@ -361,7 +388,7 @@ class MainActivity : AppCompatActivity() {
     }
     private fun copyDataToAppDirectory(uri: Uri) { 
         try { 
-            Log.i(TAG, "正在从 URI 复制数据: $uri")
+            Log.i(TAG, "[测试数据] 开始从 URI 导入: $uri")
             val dir = File(filesDir, "InstrumentedTest").apply { if (!exists()) mkdirs() }
             val targetFile = File(dir, "test_data.txt")
             
@@ -370,21 +397,20 @@ class MainActivity : AppCompatActivity() {
             }
             
             val fileSize = targetFile.length()
-            Log.i(TAG, "文件已成功导入。路径: ${targetFile.absolutePath}, 大小: $fileSize bytes")
+            Log.i(TAG, "[测试数据] 导入成功。路径: ${targetFile.absolutePath}, 大小: $fileSize bytes")
             
-            // 预览文件前几行，确保格式正确
             val preview = targetFile.bufferedReader().useLines { lines ->
                 lines.take(3).joinToString("\n")
             }
-            Log.i(TAG, "文件内容预览 (前3行):\n$preview")
+            Log.i(TAG, "[测试数据] 内容预览 (前3行):\n$preview")
 
             if (fileSize == 0L) {
-                setReportText("⚠️ 导入的文件似乎是空的！", Color.RED)
+                setReportText("⚠️ 导入的测试数据文件为空！", Color.RED)
             } else {
-                setReportText("✅ 导入成功！\n大小: $fileSize 字节\n预览:\n$preview", Color.parseColor("#006400")) 
+                setReportText("✅ 测试数据导入成功！\n大小: $fileSize 字节\n预览:\n$preview", Color.parseColor("#006400")) 
             }
         } catch (e: Exception) { 
-            Log.e(TAG, "文件导入失败", e)
+            Log.e(TAG, "[测试数据] 导入失败", e)
             setReportText("❌ 失败: ${e.message}", Color.RED) 
         } 
     }
