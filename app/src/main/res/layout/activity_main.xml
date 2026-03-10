@@ -7,10 +7,12 @@
     tools:context=".MainActivity">
 
     <ScrollView
+        android:id="@+id/main_scroll_view"
         android:layout_width="match_parent"
         android:layout_height="match_parent">
 
         <LinearLayout
+            android:id="@+id/main_content_container"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
@@ -112,6 +114,23 @@
                 android:textStyle="bold"
                 android:textSize="16sp" />
 
+            <com.example.androidinstrumentedtest.ScrollScrollView
+                android:id="@+id/report_scroll_view"
+                android:layout_width="match_parent"
+                android:layout_height="100dp"
+                android:layout_marginTop="16dp"
+                android:background="#F5F5F5">
+
+                <TextView
+                    android:id="@+id/report_text_view"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:padding="12dp"
+                    android:textIsSelectable="true"
+                    android:textSize="12sp"
+                    android:text="评测日志区域..." />
+            </com.example.androidinstrumentedtest.ScrollScrollView>
+
             <EditText
                 android:id="@+id/evaluation_edit_text"
                 android:layout_width="match_parent"
@@ -126,26 +145,12 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="启动测试"
-                android:backgroundTint="#FF4081"
+                android:text="请使用脚本文件启动测试"
+                android:enabled="false"
+                android:clickable="false"
+                android:focusable="false"
+                android:backgroundTint="#BDBDBD"
                 android:textColor="#FFFFFF" />
-
-            <com.example.androidinstrumentedtest.ScrollScrollView
-                android:id="@+id/report_scroll_view"
-                android:layout_width="match_parent"
-                android:layout_height="300dp"
-                android:layout_marginTop="16dp"
-                android:background="#F5F5F5">
-
-                <TextView
-                    android:id="@+id/report_text_view"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:padding="12dp"
-                    android:textIsSelectable="true"
-                    android:textSize="12sp"
-                    android:text="评测日志区域..." />
-            </com.example.androidinstrumentedtest.ScrollScrollView>
 
         </LinearLayout>
     </ScrollView>

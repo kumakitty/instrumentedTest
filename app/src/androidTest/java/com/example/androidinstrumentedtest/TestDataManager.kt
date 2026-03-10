@@ -13,7 +13,21 @@ class TestDataManager(private val context: Context) {
     private val tag = "TestDataManager"
     private val internalDataDir = File(context.filesDir, "InstrumentedTest")
     private val testDataFile = File(internalDataDir, "test_data.txt")
-    private val publicReportDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "InstrumentedTest")
+    // Use public Documents directory for easy access via file manager
+    // Path will be: /sdcard/Documents/InstrumentedTest
+    private val publicReportDir = File(
+        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),
+        "InstrumentedTest"
+    )
+    private val publicDebugDir = File(publicReportDir, "test_debug")
+
+    fun getDebugDir(): File {
+        if (!publicDebugDir.exists()) {
+            publicDebugDir.mkdirs()
+            Log.i(tag, "创建调试目录: ${publicDebugDir.absolutePath}")
+        }
+        return publicDebugDir
+    }
 
     fun readTestData(onTestAborted: (String) -> Unit): List<Pair<String, String>> {
         val testData = mutableListOf<Pair<String, String>>()

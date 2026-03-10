@@ -41,6 +41,8 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var reportTextView: TextView
     private lateinit var reportScrollView: ScrollScrollView
+    private lateinit var mainScrollView: ScrollView
+    private lateinit var mainContentContainer: LinearLayout
     private lateinit var importDataButton: Button
     private lateinit var calibrateButton: Button
     private lateinit var startTestButton: Button
@@ -57,21 +59,33 @@ class MainActivity : AppCompatActivity() {
     private var calibrationView: CalibrationCircleView? = null
     private var isCalibrating = false
     private var calibrationStep = 0
-    
+    // Guard report area during calibration guide so load text does not overwrite prompt.
+    private var isCalibrationGuideActive = false
+    private var cachedTestDataHeader: String? = null
+    private var isCalibrationUiShiftApplied = false
+    private var calibrationUiShiftPx = 0
+
     private val keyboardOptions = listOf("9键测试", "26键测试", "14键测试", "联想测试")
     
     // 全量校准序列 (9键用)
     private val calibrationKeys9 = listOf(
-        "2", "3", "4", "5", "6", "7", "8", "9", "0", 
-        "dropdown_btn", 
+        "2", "3", "4", "5", "6", "7", "8", "9", "0",
         "candidate_area"
     )
-    // 26键校准序列：a-z + 空格 + 功能键 + 区域
+    // 26键校准序列：a-z + 空格 + 区域
     private val calibrationKeys26 = listOf(
         "q", "w", "e", "r", "t", "y", "u", "i", "o", "p",
         "a", "s", "d", "f", "g", "h", "j", "k", "l",
         "z", "x", "c", "v", "b", "n", "m",
-        "space", "dropdown_btn", 
+        "space",
+        "candidate_area"
+    )
+    // 14键校准序列
+    private val calibrationKeys14 = listOf(
+        "qw", "er", "ty", "ui", "op",
+        "as", "df", "gh", "jk", "l",
+        "zx", "cv", "bn", "m",
+        "space",
         "candidate_area"
     )
     
@@ -99,9 +113,12 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
 
         prefs = getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
 
+        mainScrollView = findViewById(R.id.main_scroll_view)
+        mainContentContainer = findViewById(R.id.main_content_container)
         reportTextView = findViewById(R.id.report_text_view)
         reportScrollView = findViewById(R.id.report_scroll_view)
         importDataButton = findViewById(R.id.import_data_button)
@@ -114,6 +131,8 @@ class MainActivity : AppCompatActivity() {
 
         projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
+        calibrationUiShiftPx = dpToPx(220)
+
         setupKeyboardSpinner()
         refreshCalibrationList()
         refreshFileInfo()
@@ -125,6 +144,25 @@ class MainActivity : AppCompatActivity() {
             calibrateButton.setOnClickListener { requestScreenCapturePermission() }
             startTestButton.setOnClickListener { runInstrumentationTest() }
         }
+    }
+
+    private fun dpToPx(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()
+
+    private fun applyCalibrationGuideShiftAndScroll() {
+        if (!isCalibrationUiShiftApplied) {
+            isCalibrationUiShiftApplied = true
+            mainContentContainer.translationY = -calibrationUiShiftPx.toFloat()
+        }
+        mainScrollView.post {
+            val targetY = (reportScrollView.top - dpToPx(16)).coerceAtLeast(0)
+            mainScrollView.smoothScrollTo(0, targetY)
+        }
+    }
+
+    private fun restoreCalibrationGuideShiftAndScroll() {
+        if (!isCalibrationUiShiftApplied) return
+        isCalibrationUiShiftApplied = false
+        mainContentContainer.translationY = 0f
     }
 
     private fun setupKeyboardSpinner() {
@@ -210,7 +248,9 @@ class MainActivity : AppCompatActivity() {
                 keysToClear.forEach { calibrationPointsJson.remove(it) }
                 json.keys().forEach { calibrationPointsJson.put(it, json.get(it)) }
                 Log.i(TAG, "[校准] 已加载: $fileName")
-                setReportText("✅ 已加载校准: $fileName", Color.parseColor("#006400"))
+                if (!isCalibrationGuideActive && !isCalibrating) {
+                    setReportText("✅ 已加载校准: $fileName", Color.parseColor("#006400"))
+                }
             }
         } catch (e: Exception) { Log.e(TAG, "加载配置失败", e) }
     }
@@ -242,6 +282,17 @@ class MainActivity : AppCompatActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+
+        if (requestCode == SCREEN_CAPTURE_REQUEST_CODE && (resultCode != Activity.RESULT_OK || data == null)) {
+            // User canceled capture or failed to grant permission; reset guide state.
+            isCalibrationGuideActive = false
+            isCalibrating = false
+            exitCalibrationUiMode()
+            restoreCalibrationGuideShiftAndScroll()
+            stopProjection()
+            return
+        }
+
         if (resultCode != Activity.RESULT_OK || data == null) return
         when (requestCode) {
             SCREEN_CAPTURE_REQUEST_CODE -> {
@@ -258,20 +309,39 @@ class MainActivity : AppCompatActivity() {
 
     private fun startCalibrationSequence() {
         val kbType = keyboardTypeSpinner.selectedItem.toString()
-        currentCalibrationKeys = if (kbType == "26键测试") calibrationKeys26 else calibrationKeys9
-        showStageGuide(1)
+        currentCalibrationKeys = when (kbType) {
+            "26键测试" -> calibrationKeys26
+            "14键测试" -> calibrationKeys14
+            else -> calibrationKeys9
+        }
+        isCalibrationGuideActive = true
+        enterCalibrationUiMode()
+        applyCalibrationGuideShiftAndScroll()
+        setReportText("请点击测试文本框拉起输入法键盘，然后点击立即捕获。", Color.BLUE)
+        showStageGuide()
     }
 
-    private fun showStageGuide(stage: Int) {
-        val title = if (stage == 1) "阶段1：主键盘校准" else "阶段2：全屏面板校准"
-        val msg = if (stage == 1) "请保持键盘开启状态，点击捕获截图。" else "请手动展开全屏面板，点击捕获截图。"
-        AlertDialog.Builder(this).setTitle(title).setMessage(msg)
-            .setPositiveButton("立即捕获") { _, _ -> captureKeyboardAndStart(stage) }
-            .setCancelable(false).show()
+    private fun showStageGuide() {
+        applyCalibrationGuideShiftAndScroll()
+        val title = "键盘校准"
+        val msg = "请按以下步骤操作：\n\n1. 点击下方测试文本框\n2. 拉起输入法键盘\n3. 点击【立即捕获】按钮进行截屏\n\n（键盘需要保持打开状态）"
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(msg)
+            .setPositiveButton("立即捕获") { _, _ -> captureKeyboardAndStart() }
+            .setCancelable(false)
+            .create()
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        dialog.window?.setLayout((resources.displayMetrics.widthPixels * 0.9).toInt(), android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
+        dialog.show()
+
+        setReportText("📝 校准步骤：\n1. 点击测试框\n2. 拉起键盘\n3. 点击立即捕获", android.graphics.Color.BLUE)
     }
 
-    private fun captureKeyboardAndStart(stage: Int) {
-        evaluationEditText.setText(if (stage == 2) "a" else ""); evaluationEditText.requestFocus()
+    private fun captureKeyboardAndStart() {
+        applyCalibrationGuideShiftAndScroll()
+        evaluationEditText.setText("")
+        evaluationEditText.requestFocus()
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         imm.showSoftInput(evaluationEditText, InputMethodManager.SHOW_FORCED)
         val rootView = window.decorView
@@ -286,11 +356,13 @@ class MainActivity : AppCompatActivity() {
                         takeScreenshot { fullBitmap ->
                             runOnUiThread {
                                 val finalRect = Rect(); rootView.getWindowVisibleDisplayFrame(finalRect)
-                                val top = finalRect.bottom; val windowBottom = rootView.height 
+                                val top = finalRect.bottom
+                                val windowBottom = rootView.height
                                 val cropHeight = Math.max(0, windowBottom - top)
                                 keyboardSnapshot = if (cropHeight > 0) Bitmap.createBitmap(fullBitmap, 0, top, fullBitmap.width, cropHeight) else fullBitmap
-                                keyboardSnapshotTop = top; imm.hideSoftInputFromWindow(evaluationEditText.windowToken, 0)
-                                if (stage == 1) startCalibration() else resumeCalibrationAfterSnapshot()
+                                keyboardSnapshotTop = top
+                                imm.hideSoftInputFromWindow(evaluationEditText.windowToken, 0)
+                                startCalibration()
                             }
                         }
                     }, 5000)
@@ -300,26 +372,30 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCalibration() {
-        isCalibrating = true; calibrationStep = 0
+        isCalibrationGuideActive = false
+        isCalibrating = true
+        calibrationStep = 0
         if (calibrationView == null) { calibrationView = CalibrationCircleView(this); addContentView(calibrationView, ViewGroup.LayoutParams(-1, -1)) }
-        calibrationView?.visibility = View.VISIBLE; resetIndicatorPosition(); updatePrompt()
+        calibrationView?.visibility = View.VISIBLE
+        resetIndicatorPosition()
+        updatePrompt()
     }
 
-    private fun resumeCalibrationAfterSnapshot() {
-        calibrationView?.visibility = View.VISIBLE; resetIndicatorPosition(); updatePrompt()
+    private fun resetIndicatorPosition() {
+        keyboardSnapshot?.let {
+            calibrationView?.setInitialPosition(it.width / 2f, keyboardSnapshotTop + it.height / 2f)
+        }
     }
 
-    private fun resetIndicatorPosition() { keyboardSnapshot?.let { calibrationView?.setInitialPosition(it.width / 2f, keyboardSnapshotTop + it.height / 2f) } }
-
-    private fun updatePrompt() { 
+    private fun updatePrompt() {
         val key = currentCalibrationKeys[calibrationStep]
-        val prompt = when(key) {
-            "dropdown_btn" -> "请将红圈拖到 '候选词下拉按钮' 中心并确认"
-            "candidate_area" -> "请使用红框圈出 '前5位候选词' 所在的区域 并确认"
+        val prompt = when (key) {
+            "candidate_area" -> "请使用红框圈出 '首行候选词' 所在的区域 并确认"
             "space" -> "请将红圈拖到 '空格键' 中心并确认"
             else -> "请将红圈拖到按键 '$key' 中心并确认"
         }
-        setReportText("校准中 (${calibrationStep + 1}/${currentCalibrationKeys.size}):\n$prompt", Color.BLUE) 
+        val displayText = "校准中 (${calibrationStep + 1}/${currentCalibrationKeys.size}):\n$prompt"
+        setReportText(displayText, Color.BLUE)
     }
 
     private fun onCoordinateConfirmed(x: Float, y: Float) {
@@ -328,22 +404,20 @@ class MainActivity : AppCompatActivity() {
         if (key == "candidate_area") { calibrationView?.let { point.put("w", it.rectW.toDouble()); point.put("h", it.rectH.toDouble()) } }
         calibrationPointsJson.put(key, point)
         calibrationStep++
-        
+
         if (calibrationStep < currentCalibrationKeys.size) {
-            // 核心逻辑：如果下一个要录制的是 candidate_area，则先跳转到阶段 2 引导
-            if (currentCalibrationKeys[calibrationStep] == "candidate_area") {
-                calibrationView?.visibility = View.GONE
-                showStageGuide(2)
-            } else {
-                resetIndicatorPosition(); updatePrompt()
-            }
+            resetIndicatorPosition()
+            updatePrompt()
         } else {
             finishCalibration()
         }
     }
 
     private fun finishCalibration() {
+        isCalibrationGuideActive = false
         isCalibrating = false; calibrationView?.visibility = View.GONE
+        exitCalibrationUiMode()
+        restoreCalibrationGuideShiftAndScroll()
         try {
             val imeName = getCurrentImeName(); val kbType = keyboardTypeSpinner.selectedItem.toString().replace(" ", "_")
             val fileName = "cal_${imeName}_${kbType}.json"; val file = File(File(filesDir, "InstrumentedTest"), fileName)
@@ -424,20 +498,64 @@ class MainActivity : AppCompatActivity() {
         try {
             val targetFile = File(File(filesDir, "InstrumentedTest").apply { if (!exists()) mkdirs() }, targetFileName)
             contentResolver.openInputStream(uri)?.use { input -> FileOutputStream(targetFile).use { output -> input.copyTo(output) } }
-            refreshFileInfo(); setReportText("✅ $logLabel 导入成功！", Color.parseColor("#006400"))
-        } catch (e: Exception) { setReportText("❌ $logLabel 失败: ${e.message}", Color.RED) }
+            refreshFileInfo(); setReportText("✅ $logLabel 导入成功！", Color.parseColor("#006400"), isFileRelated = true)
+        } catch (e: Exception) { setReportText("❌ $logLabel 失败: ${e.message}", Color.RED, isFileRelated = true) }
     }
+
+    private fun enterCalibrationUiMode() {
+        val header = currentTestDataText.text?.toString()?.lineSequence()?.firstOrNull()?.trim().orEmpty()
+        cachedTestDataHeader = if (header.isNotEmpty()) header else "当前测试文件: 无"
+        currentTestDataText.text = cachedTestDataHeader
+        currentTestDataText.maxLines = 1
+        currentTestDataText.visibility = View.VISIBLE
+    }
+
+    private fun exitCalibrationUiMode() {
+        currentTestDataText.maxLines = Int.MAX_VALUE
+        refreshFileInfo()
+    }
+
+    fun setReportText(text: String, color: Int) {
+        setReportText(text, color, false)
+    }
+
+    fun setReportText(text: String, color: Int, isFileRelated: Boolean) {
+         runOnUiThread {
+             if (isCalibrationGuideActive && isFileRelated) return@runOnUiThread
+             reportTextView.text = text
+             reportTextView.setTextColor(color)
+             reportScrollView.post { reportScrollView.fullScroll(View.FOCUS_DOWN) }
+         }
+     }
+
+    private fun openFilePicker(requestCode: Int) { startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*" }, requestCode) }
 
     private fun runInstrumentationTest() {
-        try { Runtime.getRuntime().exec("am instrument -w com.example.androidinstrumentedtest.test/androidx.test.runner.AndroidJUnitRunner"); setReportText("🚀 已尝试启动测试。请查看 Logcat。", Color.BLUE) }
-        catch (e: Exception) { setReportText("❌ 启动失败: ${e.message}", Color.RED) }
+        try {
+            Runtime.getRuntime().exec("am instrument -w com.example.androidinstrumentedtest.test/androidx.test.runner.AndroidJUnitRunner")
+            setReportText("🚀 已尝试启动测试。请查看 Logcat。", Color.BLUE)
+        } catch (e: Exception) {
+            setReportText("❌ 启动失败: ${e.message}", Color.RED)
+        }
     }
 
-    private fun startMediaProjectionService() { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(Intent(this, MediaProjectionService::class.java)) else startService(Intent(this, MediaProjectionService::class.java)) }
-    private fun stopMediaProjectionService() { stopService(Intent(this, MediaProjectionService::class.java)) }
-    private fun stopProjection() { mediaProjection?.stop(); mediaProjection = null; stopMediaProjectionService() }
-    fun setReportText(text: String, color: Int) { runOnUiThread { reportTextView.text = text; reportTextView.setTextColor(color); reportScrollView.post { reportScrollView.fullScroll(View.FOCUS_DOWN) } } }
-    private fun openFilePicker(requestCode: Int) { startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*" }, requestCode) }
+    private fun startMediaProjectionService() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(Intent(this, MediaProjectionService::class.java))
+        } else {
+            startService(Intent(this, MediaProjectionService::class.java))
+        }
+    }
+
+    private fun stopMediaProjectionService() {
+        stopService(Intent(this, MediaProjectionService::class.java))
+    }
+
+    private fun stopProjection() {
+        mediaProjection?.stop()
+        mediaProjection = null
+        stopMediaProjectionService()
+    }
 }
 
 class ScrollScrollView(context: Context, attrs: android.util.AttributeSet? = null) : ScrollView(context, attrs)
