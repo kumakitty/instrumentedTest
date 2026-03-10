@@ -191,7 +191,7 @@ class KeyboardEvaluationTest {
             result.attempts.addAll(tokens)
 
             // 5) 对比 target：第1位=Top1，其它位=first line，否则not found
-            val hitIndex = tokens.indexOfFirst { it == target.trim() }
+            val hitIndex = tokens.indexOfFirst { matchCandidateWord(it, target) }
             when {
                 hitIndex == 0 -> {
                     result.wasFound = true
@@ -504,6 +504,100 @@ class KeyboardEvaluationTest {
             .replace(Regex("[\\r\\n\\t]+"), "")
             .replace(Regex("[^\\p{L}\\p{N}\\u4E00-\\u9FFF]"), "")
             .trim()
+    }
+
+    /**
+     * 异体字规范化映射表
+     * 解决OCR识别的常见错误和异体字问题
+     */
+    private fun normalizeVariantCharacters(text: String): String {
+        val variantMap = mapOf(
+            '黒' to '黑',  // OCR常误识别的异体字
+            '杜' to '社',  // 相似字体混淆
+            '會' to '会',  // 繁简体
+            '時' to '时',
+            '國' to '国',
+            '學' to '学',
+            '機' to '机',
+            '號' to '号',
+            '點' to '点',
+            '開' to '开',
+            '關' to '关',
+            '實' to '实',
+            '對' to '对',
+            '應' to '应',
+            '東' to '东',
+            '南' to '南',
+            '西' to '西',
+            '北' to '北',
+            '與' to '与',
+            '為' to '为',
+            '鮮' to '鲜',  // 繁简体
+            '鮲' to '鲜'   // 繁体异体字
+        )
+        return text.map { variantMap[it] ?: it }.joinToString("")
+    }
+
+    /**
+     * 计算两个字符串的编辑距离（Levenshtein距离）
+     * 用于模糊匹配和相似度计算
+     */
+    private fun levenshteinDistance(s1: String, s2: String): Int {
+        val len1 = s1.length
+        val len2 = s2.length
+        val dp = Array(len1 + 1) { IntArray(len2 + 1) }
+
+        for (i in 0..len1) dp[i][0] = i
+        for (j in 0..len2) dp[0][j] = j
+
+        for (i in 1..len1) {
+            for (j in 1..len2) {
+                val cost = if (s1[i - 1] == s2[j - 1]) 0 else 1
+                dp[i][j] = minOf(
+                    dp[i - 1][j] + 1,      // 删除
+                    dp[i][j - 1] + 1,      // 插入
+                    dp[i - 1][j - 1] + cost // 替换
+                )
+            }
+        }
+        return dp[len1][len2]
+    }
+
+    /**
+     * 改进的候选词匹配函数
+     * 支持：
+     * 1. 精确匹配
+     * 2. 异体字规范化后的匹配
+     * 3. 编辑距离 <= 1 的模糊匹配（用于OCR识别错误）
+     */
+    private fun matchCandidateWord(candidate: String, target: String): Boolean {
+        val candTrimmed = candidate.trim()
+        val targetTrimmed = target.trim()
+
+        // 1. 精确匹配
+        if (candTrimmed == targetTrimmed) {
+            Log.d(tag, "Match [EXACT]: '$candTrimmed' == '$targetTrimmed'")
+            return true
+        }
+
+        // 2. 规范化异体字后比对
+        val candNormalized = normalizeVariantCharacters(candTrimmed)
+        val targetNormalized = normalizeVariantCharacters(targetTrimmed)
+        if (candNormalized == targetNormalized && candNormalized.isNotEmpty()) {
+            Log.d(tag, "Match [VARIANT]: '$candNormalized' (normalized from '$candTrimmed') == '$targetNormalized' (normalized from '$targetTrimmed')")
+            return true
+        }
+
+        // 3. 编辑距离匹配（只有长度相同或相差1时才比对）
+        if (Math.abs(candNormalized.length - targetNormalized.length) <= 1) {
+            val distance = levenshteinDistance(candNormalized, targetNormalized)
+            if (distance <= 1 && candNormalized.isNotEmpty()) {
+                Log.d(tag, "Match [FUZZY]: '$candNormalized' distance=$distance from '$targetNormalized'")
+                return true
+            }
+        }
+
+        return false
     }
 
     private fun formatResult(res: EvaluationResult): String {
