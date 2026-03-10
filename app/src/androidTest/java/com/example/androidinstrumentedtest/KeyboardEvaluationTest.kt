@@ -108,12 +108,57 @@ class KeyboardEvaluationTest {
                             manualPositions[keyStr] = Rect(x - w / 2, y - h / 2, x + w / 2, y + h / 2)
                         } else {
                             manualPositions[keyStr] = Rect(x - 5, y - 5, x + 5, y + 5)
+                            // 对于9键/14键模式，需要添加键盘模式转换映射
+                            addKeyboardModeMapping(keyStr, Rect(x - 5, y - 5, x + 5, y + 5))
                         }
                     }
                     Log.i(tag, "已加载校准文件: $calFileName")
                 }
             }
         } catch (e: Exception) { Log.e(tag, "加载校准数据失败", e) }
+    }
+
+    /**
+     * 根据不同键盘模式添加按键映射
+     * 校准文件可能是26键格式，需要转换为9键/14键格式
+     */
+    private fun addKeyboardModeMapping(calibKey: String, rect: Rect) {
+        // 如果校准文件是26键格式，为9键和14键模式添���映射
+        when (keyboardMode) {
+            "9键测试" -> {
+                // 26键到9键的映射
+                when (calibKey) {
+                    "a", "b", "c" -> manualPositions["2"] = rect
+                    "d", "e", "f" -> manualPositions["3"] = rect
+                    "g", "h", "i" -> manualPositions["4"] = rect
+                    "j", "k", "l" -> manualPositions["5"] = rect
+                    "m", "n", "o" -> manualPositions["6"] = rect
+                    "p", "q", "r", "s" -> manualPositions["7"] = rect
+                    "t", "u", "v" -> manualPositions["8"] = rect
+                    "w", "x", "y", "z" -> manualPositions["9"] = rect
+                    " " -> manualPositions["0"] = rect
+                }
+            }
+            "14键测试" -> {
+                // 26键到14键的映射
+                when (calibKey) {
+                    "q", "w" -> manualPositions["qw"] = rect
+                    "e", "r" -> manualPositions["er"] = rect
+                    "t", "y" -> manualPositions["ty"] = rect
+                    "u", "i" -> manualPositions["ui"] = rect
+                    "o", "p" -> manualPositions["op"] = rect
+                    "a", "s" -> manualPositions["as"] = rect
+                    "d", "f" -> manualPositions["df"] = rect
+                    "g", "h" -> manualPositions["gh"] = rect
+                    "j", "k" -> manualPositions["jk"] = rect
+                    "z", "x" -> manualPositions["zx"] = rect
+                    "c", "v" -> manualPositions["cv"] = rect
+                    "b", "n" -> manualPositions["bn"] = rect
+                    " " -> manualPositions["space"] = rect
+                }
+            }
+            // 26键模式直接使用原始按键标识
+        }
     }
 
     private fun findSafeEditText(timeout: Long = 2000): UiObject2? {
