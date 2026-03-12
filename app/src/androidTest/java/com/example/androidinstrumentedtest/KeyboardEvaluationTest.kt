@@ -31,6 +31,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.math.sqrt
 
+@Suppress("DEPRECATION")
 class KeyboardEvaluationTest {
 
     @get:Rule
@@ -53,6 +54,8 @@ class KeyboardEvaluationTest {
     private val manualPositions = mutableMapOf<String, Rect>()
     private lateinit var debugDir: File
     private val recognizer by lazy {
+        // ML Kit 16.0.0 版本默认支持简体中文
+        // 如果 OCR 识别出繁体字，后续会通过 convertTraditionalToSimplified 转换
         TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
     }
 
@@ -302,6 +305,7 @@ class KeyboardEvaluationTest {
         recognizer.process(InputImage.fromBitmap(bitmap, 0))
             .addOnSuccessListener { visionText ->
                 rawText = visionText.text.replace("\n", " ").trim()
+                rawText = convertTraditionalToSimplified(rawText)  // 转换为简体中文
                 latch.countDown()
             }
             .addOnFailureListener {
@@ -311,28 +315,40 @@ class KeyboardEvaluationTest {
 
         Log.d(tag, "OCR rawText: '$rawText'")
 
-        // 用图像列分割方案（纯图像处理，不依赖OCR文本）
+        // 主要方案：使用图像分割获取候选词区域
         val segmentRects = splitByVerticalWhitespaceAdaptive(bitmap)
         Log.d(tag, "Image segments: ${segmentRects.size}")
 
-        val segmentTokens = mutableListOf<String>()
+        val allTokens = mutableListOf<String>()
         segmentRects.forEachIndexed { idx, rect ->
             val w = (rect.right - rect.left).coerceAtLeast(1)
             val h = (rect.bottom - rect.top).coerceAtLeast(1)
             val part = Bitmap.createBitmap(bitmap, rect.left, rect.top, w, h)
-            val token = normalizeOcrToken(runOcrRawText(part))
-            if (token.isNotEmpty()) {
-                segmentTokens.add(token)
-                Log.d(tag, "  segment[$idx] -> '$token' rect=$rect")
+            val segmentRawText = runOcrRawText(part)
+            
+            Log.d(tag, "  segment[$idx] raw: '$segmentRawText'")
+            
+            // 对每个图像分割的区域，按 OCR 原始文本中的空白符进一步分割
+            // 这样可以处理像 "发型风险" 这样相连的多个候选词
+            val tokens = segmentRawText.split(Regex("\\s+"))
+                .filter { it.isNotEmpty() }
+                .map { normalizeOcrToken(it) }
+                .filter { it.isNotEmpty() }
+            
+            if (tokens.isNotEmpty()) {
+                allTokens.addAll(tokens)
+                tokens.forEachIndexed { ti, token ->
+                    Log.d(tag, "    → token[$ti] '$token'")
+                }
             }
         }
 
-        Log.d(tag, "Final tokens: ${segmentTokens.size}")
-        segmentTokens.forEachIndexed { i, token ->
+        Log.d(tag, "Final tokens: ${allTokens.size}")
+        allTokens.forEachIndexed { i, token ->
             Log.d(tag, "  [$i] '$token'")
         }
 
-        return OcrResult(rawText = rawText, tokens = segmentTokens)
+        return OcrResult(rawText = rawText, tokens = allTokens)
     }
 
 
@@ -545,42 +561,112 @@ class KeyboardEvaluationTest {
     }
 
     private fun normalizeOcrToken(raw: String): String {
-        return raw
-            .replace(Regex("[\\r\\n\\t]+"), "")
-            .replace(Regex("[^\\p{L}\\p{N}\\u4E00-\\u9FFF]"), "")
+        // 保留所有有效字符（中文、英文、数字）
+        // 只移除：换行、制表符、空白、特殊符号、表情符等
+        val cleaned = raw
+            .replace(Regex("[\\r\\n\\t]+"), "")  // 移除换行和制表符
+            .replace(Regex("[^\\p{L}\\p{N}\\u4E00-\\u9FFF]"), "")  // 只保留字母、数字、汉字（CJK范围）
             .trim()
+        
+        if (cleaned.isEmpty()) {
+            Log.d(tag, "normalizeOcrToken: '$raw' → (empty after normalization)")
+            return ""
+        }
+        
+        val simplified = convertTraditionalToSimplified(cleaned)
+        Log.d(tag, "normalizeOcrToken: '$raw' → '$simplified'")
+        return simplified
     }
 
     /**
-     * 异体字规范化映射表
-     * 解决OCR识别的常见错误和异体字问题
+     * 繁简体转换映射表
+     * 处理 OCR 可能识别出的常见繁体字或异体字
      */
-    private fun normalizeVariantCharacters(text: String): String {
-        val variantMap = mapOf(
-            '黒' to '黑',  // OCR常误识别的异体字
-            '杜' to '社',  // 相似字体混淆
-            '會' to '会',  // 繁简体
-            '時' to '时',
-            '國' to '国',
-            '學' to '学',
-            '機' to '机',
-            '號' to '号',
-            '點' to '点',
-            '開' to '开',
-            '關' to '关',
-            '實' to '实',
-            '對' to '对',
-            '應' to '应',
-            '東' to '东',
-            '南' to '南',
-            '西' to '西',
-            '北' to '北',
-            '與' to '与',
-            '為' to '为',
-            '鮮' to '鲜',  // 繁简体
-            '鮲' to '鲜'   // 繁体异体字
+    private fun convertTraditionalToSimplified(text: String): String {
+        val conversionMap = mapOf(
+            // 常见繁体到简体
+            '會' to '会', '時' to '时', '國' to '国', '學' to '学', '機' to '机', '號' to '号',
+            '點' to '点', '開' to '开', '關' to '关', '實' to '实', '對' to '对', '應' to '应',
+            '東' to '东', '與' to '与', '為' to '为', '鮮' to '鲜', '鮲' to '鲜',
+            // OCR 常见识别错误（繁体或异体字）
+            '黒' to '黑',  // OCR 误识别的黑
+            '杜' to '社',  // 社被识别为杜
+            '會' to '会',
+            '貫' to '贯',
+            '藝' to '艺',
+            '習' to '习',
+            '從' to '从',
+            '種' to '种',
+            '質' to '质',
+            '親' to '亲',
+            '驗' to '验',
+            '進' to '进',
+            '運' to '运',
+            '動' to '动',
+            '廣' to '广',
+            '場' to '场',
+            '練' to '练',
+            '複' to '复',
+            '雜' to '杂',
+            '單' to '单',
+            '組' to '组',
+            '織' to '织',
+            '計' to '计',
+            '劃' to '划',
+            '標' to '标',
+            '準' to '准',
+            '確' to '确',
+            '認' to '认',
+            '識' to '识',
+            '轉' to '转',
+            '變' to '变',
+            '環' to '环',
+            '境' to '境',
+            '問' to '问',
+            '題' to '题',
+            '達' to '达',
+            '現' to '现',
+            '象' to '象',
+            '數' to '数',
+            '據' to '据',
+            '資' to '资',
+            '歷' to '历',
+            '歲' to '岁',
+            '蒙' to '蒙',
+            '著' to '着',
+            '記' to '记',
+            '議' to '议',
+            '論' to '论',
+            '證' to '证',
+            '構' to '构',
+            '統' to '统',
+            '貨' to '货',
+            '幣' to '币',
+            '調' to '调',
+            '價' to '价',
+            '賣' to '卖',
+            '買' to '买',
+            '賃' to '赁',
+            '租' to '租',
+            '義' to '义',
+            '經' to '经',
+            '費' to '费',
+            '務' to '务',
+            '訊' to '讯',
+            '息' to '息',
+            '訴' to '诉',
+            '訓' to '训',
+            '詞' to '词',
+            '詩' to '诗',
+            '詰' to '诘',
+            '詳' to '详',
+            '誘' to '诱',
+            '誠' to '诚',
+            '誤' to '误',
+            '誰' to '谁',
+            '調' to '调'
         )
-        return text.map { variantMap[it] ?: it }.joinToString("")
+        return text.map { conversionMap[it] ?: it }.joinToString("")
     }
 
     /**
@@ -609,40 +695,25 @@ class KeyboardEvaluationTest {
     }
 
     /**
-     * 改进的候选词匹配函数
-     * 支持：
-     * 1. 精确匹配
-     * 2. 异体字规范化后的匹配
-     * 3. 编辑距离 <= 1 的模糊匹配（用于OCR识别错误）
+     * 简体中文候选词精确匹配函数
+     * 只支持精确匹配，不允许模糊匹配
+     * 原因：模糊匹配（编辑距离）会导致错误的 SUCCESS
+     * 例如："发泄" 不应该匹配 "发型"（相差1字符）
      */
     private fun matchCandidateWord(candidate: String, target: String): Boolean {
         val candTrimmed = candidate.trim()
         val targetTrimmed = target.trim()
 
-        // 1. 精确匹配
-        if (candTrimmed == targetTrimmed) {
+        // 只支持精确匹配
+        val isExactMatch = candTrimmed == targetTrimmed
+        
+        if (isExactMatch) {
             Log.d(tag, "Match [EXACT]: '$candTrimmed' == '$targetTrimmed'")
-            return true
+        } else {
+            Log.d(tag, "NoMatch: '$candTrimmed' != '$targetTrimmed'")
         }
-
-        // 2. 规范化异体字后比对
-        val candNormalized = normalizeVariantCharacters(candTrimmed)
-        val targetNormalized = normalizeVariantCharacters(targetTrimmed)
-        if (candNormalized == targetNormalized && candNormalized.isNotEmpty()) {
-            Log.d(tag, "Match [VARIANT]: '$candNormalized' (normalized from '$candTrimmed') == '$targetNormalized' (normalized from '$targetTrimmed')")
-            return true
-        }
-
-        // 3. 编辑距离匹配（只有长度相同或相差1时才比对）
-        if (Math.abs(candNormalized.length - targetNormalized.length) <= 1) {
-            val distance = levenshteinDistance(candNormalized, targetNormalized)
-            if (distance <= 1 && candNormalized.isNotEmpty()) {
-                Log.d(tag, "Match [FUZZY]: '$candNormalized' distance=$distance from '$targetNormalized'")
-                return true
-            }
-        }
-
-        return false
+        
+        return isExactMatch
     }
 
     private fun formatResult(res: EvaluationResult): String {

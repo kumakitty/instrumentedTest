@@ -37,6 +37,7 @@ import java.nio.ByteBuffer
 import kotlin.math.pow
 import kotlin.math.sqrt
 
+@Suppress("DEPRECATION")
 class MainActivity : AppCompatActivity() {
 
     private lateinit var reportTextView: TextView
