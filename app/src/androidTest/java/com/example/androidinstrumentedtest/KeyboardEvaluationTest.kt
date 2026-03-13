@@ -63,7 +63,6 @@ class KeyboardEvaluationTest {
      * 格式: 错误识别 -> 正确字符的列表（按概率排序）
      */
     private val ocrErrorCorrections = mapOf(
-        "黑" to listOf("嘿"),      // 黑 vs 嘿 - 最常见的混淆
         "費" to listOf("费"),      // 繁体费 -> 简体费
         "鎖" to listOf("锁"),      // 繁体锁 -> 简体锁
     )
@@ -300,83 +299,94 @@ class KeyboardEvaluationTest {
     }
 
     /**
-     * 改进的单行OCR分割策略 - 纯图像列分割方案
+     * 改进的单行OCR分割策略 - 纯图像列分割 + OCR
      *
-     * 问题背景：
-     * - 候选词区域是连续图像行，词间只有视觉空白（空像素），不是实际字符
-     * - OCR原始文本根本没有空白符（候选词直接连接）
-     * - 例子："消費者 修房子 小饭桌新发見" → 实际是最后两词无空白
-     *
-     * 解决方案：纯图像列分割（四步）
-     * 1. 计算每列的暗像素密度（墨迹分布）
-     * 2. 识别连续的墨迹块（候选词的位置）
-     * 3. 用统计方法判断相邻块间隙是否为词界
-     * 4. 逐块单独OCR识别
+     * 核心策略：
+     * 1. 第一步：纯图像处理 - 计算每列的暗像素密度，识别连续的墨迹块
+     * 2. 第二步：对每个块单独 OCR - 得到每个块的文本
+     * 
+     * 优势：
+     * - 只做一次 OCR（对每个块的 OCR）
+     * - 避免了整体 OCR 后启发式分割 token 的各种问题
+     * - 每个 OCR 块对应一个候选词，精准度高
      */
     private fun runOcrSingleLineInOrder(bitmap: Bitmap): OcrResult {
-        val latch = CountDownLatch(1)
-        var rawText = ""
-
-        recognizer.process(InputImage.fromBitmap(bitmap, 0))
-            .addOnSuccessListener { visionText ->
-                rawText = visionText.text.replace("\n", " ").trim()
-                rawText = convertTraditionalToSimplified(rawText)  // 转换为简体中文
-                latch.countDown()
-            }
-            .addOnFailureListener {
-                latch.countDown()
-            }
-        latch.await(10, TimeUnit.SECONDS)
-
-        Log.d(tag, "OCR rawText: '$rawText'")
-
-        // 主要方案：使用图像分割获取候选词区域
+        Log.d(tag, "===== runOcrSingleLineInOrder 开始 =====")
+        
+        // 第一步：纯图像分割 - 计算每列的墨迹密度，找出候选词的区域
+        Log.d(tag, "第一步：纯图像分割...")
         val segmentRects = splitByVerticalWhitespaceAdaptive(bitmap)
-        Log.d(tag, "Image segments: ${segmentRects.size}")
-
+        Log.d(tag, "分割结果: ${segmentRects.size} 个矩形")
+        
+        // 第二步：对每个分割块进行 OCR
+        Log.d(tag, "第二步：对 ${segmentRects.size} 个块进行 OCR...")
         val allTokens = mutableListOf<String>()
-        segmentRects.forEachIndexed { idx, rect ->
-            val w = (rect.right - rect.left).coerceAtLeast(1)
-            val h = (rect.bottom - rect.top).coerceAtLeast(1)
+        var rawText = ""  // 记录所有 OCR 结果用于调试
+        
+        if (segmentRects.isEmpty()) {
+            // 没有分割（图片太简单或只有一个候选词）
+            Log.d(tag, "没有分割矩形，对整个图片进行 OCR")
+            val enhancedBitmap = enhanceImageContrast(bitmap)
+            val latch = CountDownLatch(1)
             
-            // 验证分割矩形的合理性
-            val minSegmentWidth = bitmap.width * 0.03f  // 最小宽度：图像宽度的3%
-            if (w < minSegmentWidth) {
-                Log.w(tag, "  segment[$idx] 宽度过小: ${w}px < ${minSegmentWidth}px，可能是分割错误")
-            }
-            if (h < 4) {
-                Log.w(tag, "  segment[$idx] 高度过小: ${h}px，可能是分割错误")
-            }
+            recognizer.process(InputImage.fromBitmap(enhancedBitmap, 0))
+                .addOnSuccessListener { visionText ->
+                    rawText = visionText.text.replace("\n", " ").trim()
+                    rawText = convertTraditionalToSimplified(rawText)
+                    Log.d(tag, "整体 OCR: '$rawText'")
+                    latch.countDown()
+                }
+                .addOnFailureListener {
+                    Log.w(tag, "整体 OCR 失败")
+                    latch.countDown()
+                }
+            latch.await(10, TimeUnit.SECONDS)
             
-            // 调试信息：记录分割矩形
-            Log.d(tag, "  segment[$idx] rect: (${rect.left},${rect.top}) - (${rect.right},${rect.bottom}) size: ${w}x${h}")
-            
-            val part = Bitmap.createBitmap(bitmap, rect.left, rect.top, w, h)
-            val segmentRawText = runOcrRawText(part)
-            
-            Log.d(tag, "  segment[$idx] OCR raw: '$segmentRawText'")
-
-            // 对每个图像分割的区域，按 OCR 原始文本中的空白符进一步分割
-            // 这样可以处理像 "发型风险" 这样相连的多个候选词
-            val tokens = segmentRawText.split(Regex("\\s+"))
+            // 按空白符分割
+            val tokens = rawText.split(Regex("\\s+"))
                 .filter { it.isNotEmpty() }
                 .map { normalizeOcrToken(it) }
                 .filter { it.isNotEmpty() }
-            
-            if (tokens.isNotEmpty()) {
-                allTokens.addAll(tokens)
-                tokens.forEachIndexed { ti, token ->
-                    Log.d(tag, "    → token[$ti] '$token'")
+            allTokens.addAll(tokens)
+        } else {
+            // 有分割矩形，对每个块进行 OCR
+            segmentRects.forEachIndexed { idx, rect ->
+                val w = (rect.right - rect.left).coerceAtLeast(1)
+                val h = (rect.bottom - rect.top).coerceAtLeast(1)
+                
+                Log.d(tag, "  segment[$idx] rect: (${rect.left},${rect.top}) - (${rect.right},${rect.bottom}) size: ${w}x${h}")
+                
+                // 创建子图像
+                val part = Bitmap.createBitmap(bitmap, rect.left, rect.top, w, h)
+                
+                // 对这个块进行 OCR
+                val blockOcrText = runOcrRawText(part)
+                Log.d(tag, "    OCR 结果: '$blockOcrText'")
+                
+                if (blockOcrText.isNotEmpty()) {
+                    rawText += if (rawText.isEmpty()) blockOcrText else " $blockOcrText"
+                    
+                    // 按空白符分割该块的 OCR 结果（一个块可能包含多个词）
+                    val blockTokens = blockOcrText.split(Regex("\\s+"))
+                        .filter { it.isNotEmpty() }
+                        .map { normalizeOcrToken(it) }
+                        .filter { it.isNotEmpty() }
+                    
+                    if (blockTokens.isNotEmpty()) {
+                        allTokens.addAll(blockTokens)
+                        blockTokens.forEachIndexed { ti, token ->
+                            Log.d(tag, "      token[$ti] '$token'")
+                        }
+                    }
                 }
-            } else {
-                Log.w(tag, "  segment[$idx] 无有效token产生")
             }
         }
 
-        Log.d(tag, "Final tokens: ${allTokens.size}")
+        Log.d(tag, "最终 tokens 数: ${allTokens.size}")
         allTokens.forEachIndexed { i, token ->
             Log.d(tag, "  [$i] '$token'")
         }
+        Log.d(tag, "===== runOcrSingleLineInOrder 结束 =====")
 
         return OcrResult(rawText = rawText, tokens = allTokens)
     }
@@ -726,8 +736,45 @@ class KeyboardEvaluationTest {
         return try {
             // 使用 OpenCC4j 的正确 API：toSimple()
             val simplified = ZhConverterUtil.toSimple(text)
-            
+
+            // 检测转换是否产生了非中文字符（防止"才"→"オ"这类问题）
             if (simplified != text) {
+                // 检查是否产生了非中文的异常字符
+                val hasForeignChars = simplified.any { char ->
+                    val code = char.code
+                    // 中文范围: CJK Unified Ideographs (4E00-9FFF) + CJK Ext A/B (3400-4DBF, 20000-2A6DF)
+                    // 数字: 0-9
+                    // 英文: a-z, A-Z
+                    !(code in 0x4E00..0x9FFF ||  // 主要中文字符范围
+                      code in 0x3400..0x4DBF ||  // CJK扩展 A
+                      code in 0x20000..0x2A6DF || // CJK扩展 B
+                      (code >= '0'.code && code <= '9'.code) ||  // 数字
+                      (code >= 'a'.code && code <= 'z'.code) ||  // 小写英文
+                      (code >= 'A'.code && code <= 'Z'.code))    // 大写英文
+                }
+
+                if (hasForeignChars) {
+                    Log.e(tag, "⚠️ 警告: OpenCC 转换产生了非中文字符! input='$text' output='$simplified'")
+                    Log.d(tag, "  转换被拒绝，返回原文本")
+                    return text
+                }
+                
+                // 新增：检查转换是否改变了太多字符（防止"社"→"杜"这类错误）
+                // 计算有多少个字符被改变了
+                var changedCount = 0
+                for (i in text.indices) {
+                    if (i < simplified.length && text[i] != simplified[i]) {
+                        changedCount++
+                    }
+                }
+                
+                // 如果改变的字符数占比太高（>50%），说明转换可能有问题
+                if (text.length > 0 && changedCount > text.length / 2) {
+                    Log.e(tag, "⚠️ 警告: OpenCC 转换改变过多字符! " +
+                        "input='$text' output='$simplified' changed=$changedCount/${text.length}")
+                    return text
+                }
+
                 Log.d(tag, "OpenCC 转换: '$text' → '$simplified'")
             }
             simplified
