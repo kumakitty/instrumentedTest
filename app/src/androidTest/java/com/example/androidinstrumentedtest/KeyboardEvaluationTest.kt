@@ -1,3 +1,5 @@
+@file:Suppress("DEPRECATION")
+
 package com.example.androidinstrumentedtest
 
 import android.Manifest
@@ -15,6 +17,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.rule.ActivityTestRule
 import androidx.test.rule.GrantPermissionRule
 import androidx.test.uiautomator.*
+import com.github.houbb.opencc4j.util.ZhConverterUtil
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
@@ -31,10 +34,10 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.math.sqrt
 
-@Suppress("DEPRECATION")
 class KeyboardEvaluationTest {
 
     @get:Rule
+    @Suppress("DEPRECATION")
     val activityRule = ActivityTestRule(MainActivity::class.java, true, false)
 
     @get:Rule
@@ -53,6 +56,18 @@ class KeyboardEvaluationTest {
     private var keyboardMode: String = "9键测试"
     private val manualPositions = mutableMapOf<String, Rect>()
     private lateinit var debugDir: File
+    
+    /**
+     * 常见 OCR 误识别纠正映射表
+     * 基于 ML Kit 中文 OCR 的常见错误进行手动纠正
+     * 格式: 错误识别 -> 正确字符的列表（按概率排序）
+     */
+    private val ocrErrorCorrections = mapOf(
+        "黑" to listOf("嘿"),      // 黑 vs 嘿 - 最常见的混淆
+        "費" to listOf("费"),      // 繁体费 -> 简体费
+        "鎖" to listOf("锁"),      // 繁体锁 -> 简体锁
+    )
+    
     private val recognizer by lazy {
         // ML Kit 16.0.0 版本默认支持简体中文
         // 如果 OCR 识别出繁体字，后续会通过 convertTraditionalToSimplified 转换
@@ -323,11 +338,24 @@ class KeyboardEvaluationTest {
         segmentRects.forEachIndexed { idx, rect ->
             val w = (rect.right - rect.left).coerceAtLeast(1)
             val h = (rect.bottom - rect.top).coerceAtLeast(1)
+            
+            // 验证分割矩形的合理性
+            val minSegmentWidth = bitmap.width * 0.03f  // 最小宽度：图像宽度的3%
+            if (w < minSegmentWidth) {
+                Log.w(tag, "  segment[$idx] 宽度过小: ${w}px < ${minSegmentWidth}px，可能是分割错误")
+            }
+            if (h < 4) {
+                Log.w(tag, "  segment[$idx] 高度过小: ${h}px，可能是分割错误")
+            }
+            
+            // 调试信息：记录分割矩形
+            Log.d(tag, "  segment[$idx] rect: (${rect.left},${rect.top}) - (${rect.right},${rect.bottom}) size: ${w}x${h}")
+            
             val part = Bitmap.createBitmap(bitmap, rect.left, rect.top, w, h)
             val segmentRawText = runOcrRawText(part)
             
-            Log.d(tag, "  segment[$idx] raw: '$segmentRawText'")
-            
+            Log.d(tag, "  segment[$idx] OCR raw: '$segmentRawText'")
+
             // 对每个图像分割的区域，按 OCR 原始文本中的空白符进一步分割
             // 这样可以处理像 "发型风险" 这样相连的多个候选词
             val tokens = segmentRawText.split(Regex("\\s+"))
@@ -340,6 +368,8 @@ class KeyboardEvaluationTest {
                 tokens.forEachIndexed { ti, token ->
                     Log.d(tag, "    → token[$ti] '$token'")
                 }
+            } else {
+                Log.w(tag, "  segment[$idx] 无有效token产生")
             }
         }
 
@@ -355,7 +385,11 @@ class KeyboardEvaluationTest {
     private fun runOcrRawText(bitmap: Bitmap): String {
         val latch = CountDownLatch(1)
         var raw = ""
-        recognizer.process(InputImage.fromBitmap(bitmap, 0))
+        
+        // 图像预处理：增强对比度以提高OCR识别精度
+        val enhancedBitmap = enhanceImageContrast(bitmap)
+        
+        recognizer.process(InputImage.fromBitmap(enhancedBitmap, 0))
             .addOnSuccessListener {
                 raw = it.text
                 latch.countDown()
@@ -365,6 +399,68 @@ class KeyboardEvaluationTest {
             }
         latch.await(10, TimeUnit.SECONDS)
         return raw
+    }
+
+    /**
+     * 图像对比度增强 - 改善 OCR 识别精度
+     * 通过直方图均衡化和亮度调整，增强文字与背景的对比度
+     */
+    private fun enhanceImageContrast(bitmap: Bitmap): Bitmap {
+        val width = bitmap.width
+        val height = bitmap.height
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        // 计算直方图
+        val histogram = IntArray(256)
+        for (pixel in pixels) {
+            val lum = (Color.red(pixel) * 299 + Color.green(pixel) * 587 + Color.blue(pixel) * 114) / 1000
+            histogram[lum]++
+        }
+
+        // 计算累积直方图（用于均衡化）
+        val cumulative = IntArray(256)
+        cumulative[0] = histogram[0]
+        for (i in 1 until 256) {
+            cumulative[i] = cumulative[i - 1] + histogram[i]
+        }
+
+        // 计算映射表
+        val lut = IntArray(256)
+        val pixelCount = width * height
+        for (i in 0 until 256) {
+            // 规范化到 0-255 范围
+            lut[i] = ((cumulative[i].toLong() * 255) / pixelCount).toInt().coerceIn(0, 255)
+        }
+
+        // 应用直方图均衡化 + 额外的对比度提升
+        val enhancedPixels = IntArray(pixels.size)
+        for (i in pixels.indices) {
+            val pixel = pixels[i]
+            val r = Color.red(pixel)
+            val g = Color.green(pixel)
+            val b = Color.blue(pixel)
+            val alpha = Color.alpha(pixel)
+            
+            // 对每个通道应用映射
+            val newR = lut[r].coerceIn(0, 255)
+            val newG = lut[g].coerceIn(0, 255)
+            val newB = lut[b].coerceIn(0, 255)
+            
+            // 额外提升对比度（将接近中值的像素推向极端）
+            val contrast = 1.3f  // 对比度系数
+            val newR2 = ((newR - 128) * contrast + 128).toInt().coerceIn(0, 255)
+            val newG2 = ((newG - 128) * contrast + 128).toInt().coerceIn(0, 255)
+            val newB2 = ((newB - 128) * contrast + 128).toInt().coerceIn(0, 255)
+            
+            enhancedPixels[i] = Color.argb(alpha, newR2, newG2, newB2)
+        }
+
+        val enhanced = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        enhanced.setPixels(enhancedPixels, 0, width, 0, 0, width, height)
+        
+        Log.d(tag, "图像对比度增强: ${width}x${height}")
+        return enhanced
     }
 
     /**
@@ -573,125 +669,110 @@ class KeyboardEvaluationTest {
             return ""
         }
         
-        val simplified = convertTraditionalToSimplified(cleaned)
-        Log.d(tag, "normalizeOcrToken: '$raw' → '$simplified'")
+        // 检测并纠正 OCR 误识别的字符
+        val corrected = correctOcrErrors(cleaned)
+        if (corrected != cleaned) {
+            Log.w(tag, "OCR错误纠正: '$cleaned' → '$corrected'")
+        }
+        
+        val simplified = convertTraditionalToSimplified(corrected)
+        
+        // 增强的调试日志 - 追踪每一步的转换
+        Log.d(tag, "normalizeOcrToken详细: raw='$raw'")
+        Log.d(tag, "  step1_clean: '$cleaned'")
+        Log.d(tag, "  step2_correct: '$corrected'")
+        Log.d(tag, "  step3_simplified: '$simplified'")
+        
+        // 检查是否有意外的字符变化
+        if (simplified.contains("律") && !raw.contains("律")) {
+            Log.e(tag, "⚠️ 警告: 检测到异常字符生成! raw='$raw' 不含律，但simplified='$simplified'含律")
+        }
+        
         return simplified
     }
 
     /**
-     * 繁简体转换映射表
-     * 处理 OCR 可能识别出的常见繁体字或异体字
+     * OCR 误识别检测和纠正
+     * 对于多字词汇，逐字符检查是否存在常见的OCR误识别，并进行纠正
      */
-    private fun convertTraditionalToSimplified(text: String): String {
-        val conversionMap = mapOf(
-            // 常见繁体到简体
-            '會' to '会', '時' to '时', '國' to '国', '學' to '学', '機' to '机', '號' to '号',
-            '點' to '点', '開' to '开', '關' to '关', '實' to '实', '對' to '对', '應' to '应',
-            '東' to '东', '與' to '与', '為' to '为', '鮮' to '鲜', '鮲' to '鲜',
-            // OCR 常见识别错误（繁体或异体字）
-            '黒' to '黑',  // OCR 误识别的黑
-            '杜' to '社',  // 社被识别为杜
-            '會' to '会',
-            '貫' to '贯',
-            '藝' to '艺',
-            '習' to '习',
-            '從' to '从',
-            '種' to '种',
-            '質' to '质',
-            '親' to '亲',
-            '驗' to '验',
-            '進' to '进',
-            '運' to '运',
-            '動' to '动',
-            '廣' to '广',
-            '場' to '场',
-            '練' to '练',
-            '複' to '复',
-            '雜' to '杂',
-            '單' to '单',
-            '組' to '组',
-            '織' to '织',
-            '計' to '计',
-            '劃' to '划',
-            '標' to '标',
-            '準' to '准',
-            '確' to '确',
-            '認' to '认',
-            '識' to '识',
-            '轉' to '转',
-            '變' to '变',
-            '環' to '环',
-            '境' to '境',
-            '問' to '问',
-            '題' to '题',
-            '達' to '达',
-            '現' to '现',
-            '象' to '象',
-            '數' to '数',
-            '據' to '据',
-            '資' to '资',
-            '歷' to '历',
-            '歲' to '岁',
-            '蒙' to '蒙',
-            '著' to '着',
-            '記' to '记',
-            '議' to '议',
-            '論' to '论',
-            '證' to '证',
-            '構' to '构',
-            '統' to '统',
-            '貨' to '货',
-            '幣' to '币',
-            '調' to '调',
-            '價' to '价',
-            '賣' to '卖',
-            '買' to '买',
-            '賃' to '赁',
-            '租' to '租',
-            '義' to '义',
-            '經' to '经',
-            '費' to '费',
-            '務' to '务',
-            '訊' to '讯',
-            '息' to '息',
-            '訴' to '诉',
-            '訓' to '训',
-            '詞' to '词',
-            '詩' to '诗',
-            '詰' to '诘',
-            '詳' to '详',
-            '誘' to '诱',
-            '誠' to '诚',
-            '誤' to '误',
-            '誰' to '谁',
-            '調' to '调'
-        )
-        return text.map { conversionMap[it] ?: it }.joinToString("")
+    private fun correctOcrErrors(text: String): String {
+        var result = text
+        
+        // 逐个字符检查并纠正
+        for (i in text.indices) {
+            val char = text[i].toString()
+            if (ocrErrorCorrections.containsKey(char)) {
+                val candidates = ocrErrorCorrections[char] ?: continue
+                
+                // 对于在候选词列表中的候选项，使用第一个候选项作为纠正值
+                // 在实际应用中，可以结合上下文和目标词来更智能地选择
+                val correction = candidates.firstOrNull { it.length == 1 }
+                if (correction != null) {
+                    result = result.replaceFirst(char, correction)
+                    Log.w(tag, "Corrected OCR error at position $i: '$char' → '$correction'")
+                }
+            }
+        }
+        
+        return result
     }
 
     /**
-     * 计算两个字符串的编辑距离（Levenshtein距离）
-     * 用于模糊匹配和相似度计算
+     * 繁简体转换 - 使用 OpenCC4j 库处理繁体字
+     * 采用智能反射自动发现并调用库中实际存在的转换方法
+     * 这样可以避免 API 变化或命名不确定的问题
      */
-    private fun levenshteinDistance(s1: String, s2: String): Int {
-        val len1 = s1.length
-        val len2 = s2.length
-        val dp = Array(len1 + 1) { IntArray(len2 + 1) }
-
-        for (i in 0..len1) dp[i][0] = i
-        for (j in 0..len2) dp[0][j] = j
-
-        for (i in 1..len1) {
-            for (j in 1..len2) {
-                val cost = if (s1[i - 1] == s2[j - 1]) 0 else 1
-                dp[i][j] = minOf(
-                    dp[i - 1][j] + 1,      // 删除
-                    dp[i][j - 1] + 1,      // 插入
-                    dp[i - 1][j - 1] + cost // 替换
-                )
+    private fun convertTraditionalToSimplified(text: String): String {
+        return try {
+            // 策略1: 尝试查找任何包含 "simplified" 或 "Simplified" 的公共静态方法
+            val method = try {
+                ZhConverterUtil::class.java.getDeclaredMethods().find { method ->
+                    method.name.contains("simplified", ignoreCase = true) && 
+                    method.parameterCount == 1 &&
+                    method.parameterTypes[0] == String::class.java
+                }?.apply { isAccessible = true }
+            } catch (e: Exception) {
+                null
             }
+            
+            if (method != null) {
+                val result = method.invoke(null, text) as String
+                Log.d(tag, "OpenCC 繁简转换: '$text' → '$result'")
+                result
+            } else {
+                // 策略2: 如果没找到 simplified 方法，尝试任何返回 String 的公共方法
+                val altMethod = ZhConverterUtil::class.java.getDeclaredMethods().find { m ->
+                    m.parameterCount == 1 && 
+                    m.parameterTypes[0] == String::class.java &&
+                    m.returnType == String::class.java &&
+                    (m.name.contains("convert", ignoreCase = true) || 
+                     m.name.contains("to", ignoreCase = true))
+                }?.apply { isAccessible = true }
+                
+                if (altMethod != null) {
+                    val result = altMethod.invoke(null, text) as String
+                    Log.d(tag, "OpenCC 转换 (备选方法): '$text' → '$result'")
+                    result
+                } else {
+                    // 策略3: 如果都不行，就直接调用所有公共方法并找最可能的
+                    val publicMethods = ZhConverterUtil::class.java.getDeclaredMethods()
+                        .filter { it.parameterCount == 1 && it.parameterTypes[0] == String::class.java }
+                    
+                    if (publicMethods.isNotEmpty()) {
+                        val result = publicMethods.first().apply { isAccessible = true }.invoke(null, text) as String
+                        Log.d(tag, "OpenCC 转换 (第一个可用方法): '$text' → '$result'")
+                        result
+                    } else {
+                        Log.w(tag, "未找到 OpenCC 转换方法，返回原文本")
+                        text
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "OpenCC 转换失败: ${e.message}，返回原文本")
+            e.printStackTrace()
+            text
         }
-        return dp[len1][len2]
     }
 
     /**

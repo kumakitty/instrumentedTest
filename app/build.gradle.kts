@@ -65,6 +65,9 @@ dependencies {
     
     // OCR 依赖
     implementation("com.google.mlkit:text-recognition-chinese:16.0.0")
+    
+    // 繁简体转换库 - OpenCC（比手动映射表更彻底）
+    implementation("com.github.houbb:opencc4j:1.7.2")
 
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
