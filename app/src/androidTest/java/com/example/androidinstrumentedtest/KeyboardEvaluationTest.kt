@@ -718,59 +718,21 @@ class KeyboardEvaluationTest {
     }
 
     /**
-     * 繁简体转换 - 使用 OpenCC4j 库处理繁体字
-     * 采用智能反射自动发现并调用库中实际存在的转换方法
-     * 这样可以避免 API 变化或命名不确定的问题
+     * 繁简体转换 - 使用 OpenCC4j 库处理 OCR 候选词
+     * 将 OCR 输出的任何繁体字转换为简体
+     * 这样确保 candidates 都是简体，便于与 target 匹配
      */
     private fun convertTraditionalToSimplified(text: String): String {
         return try {
-            // 策略1: 尝试查找任何包含 "simplified" 或 "Simplified" 的公共静态方法
-            val method = try {
-                ZhConverterUtil::class.java.getDeclaredMethods().find { method ->
-                    method.name.contains("simplified", ignoreCase = true) && 
-                    method.parameterCount == 1 &&
-                    method.parameterTypes[0] == String::class.java
-                }?.apply { isAccessible = true }
-            } catch (e: Exception) {
-                null
-            }
+            // 使用 OpenCC4j 的正确 API：toSimple()
+            val simplified = ZhConverterUtil.toSimple(text)
             
-            if (method != null) {
-                val result = method.invoke(null, text) as String
-                Log.d(tag, "OpenCC 繁简转换: '$text' → '$result'")
-                result
-            } else {
-                // 策略2: 如果没找到 simplified 方法，尝试任何返回 String 的公共方法
-                val altMethod = ZhConverterUtil::class.java.getDeclaredMethods().find { m ->
-                    m.parameterCount == 1 && 
-                    m.parameterTypes[0] == String::class.java &&
-                    m.returnType == String::class.java &&
-                    (m.name.contains("convert", ignoreCase = true) || 
-                     m.name.contains("to", ignoreCase = true))
-                }?.apply { isAccessible = true }
-                
-                if (altMethod != null) {
-                    val result = altMethod.invoke(null, text) as String
-                    Log.d(tag, "OpenCC 转换 (备选方法): '$text' → '$result'")
-                    result
-                } else {
-                    // 策略3: 如果都不行，就直接调用所有公共方法并找最可能的
-                    val publicMethods = ZhConverterUtil::class.java.getDeclaredMethods()
-                        .filter { it.parameterCount == 1 && it.parameterTypes[0] == String::class.java }
-                    
-                    if (publicMethods.isNotEmpty()) {
-                        val result = publicMethods.first().apply { isAccessible = true }.invoke(null, text) as String
-                        Log.d(tag, "OpenCC 转换 (第一个可用方法): '$text' → '$result'")
-                        result
-                    } else {
-                        Log.w(tag, "未找到 OpenCC 转换方法，返回原文本")
-                        text
-                    }
-                }
+            if (simplified != text) {
+                Log.d(tag, "OpenCC 转换: '$text' → '$simplified'")
             }
+            simplified
         } catch (e: Exception) {
             Log.w(tag, "OpenCC 转换失败: ${e.message}，返回原文本")
-            e.printStackTrace()
             text
         }
     }
