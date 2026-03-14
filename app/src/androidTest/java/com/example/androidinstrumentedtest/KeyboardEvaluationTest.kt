@@ -4,29 +4,35 @@ package com.example.androidinstrumentedtest
 
 import android.Manifest
 import android.app.Instrumentation
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Rect
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.rule.ActivityTestRule
 import androidx.test.rule.GrantPermissionRule
-import androidx.test.uiautomator.*
-import com.github.houbb.opencc4j.util.ZhConverterUtil
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
+import androidx.test.uiautomator.By
+import androidx.test.uiautomator.UiDevice
+import androidx.test.uiautomator.UiObject2
+import androidx.test.uiautomator.Until
+import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -36,63 +42,70 @@ import kotlin.math.sqrt
 
 class KeyboardEvaluationTest {
 
+    companion object {
+        /** 所有输出文件的根目录，修改这里可以统一变更保存路径 */
+        const val OUTPUT_DIR = "/sdcard/Documents/InstrumentedTest"
+        @Volatile
+        private var outputClearedOnce = false
+    }
+
     @get:Rule
-    @Suppress("DEPRECATION")
     val activityRule = ActivityTestRule(MainActivity::class.java, true, false)
 
     @get:Rule
     val grantPermissionRule: GrantPermissionRule = GrantPermissionRule.grant(
         Manifest.permission.READ_EXTERNAL_STORAGE,
-        Manifest.permission.WRITE_EXTERNAL_STORAGE
+        Manifest.permission.WRITE_EXTERNAL_STORAGE,
+        Manifest.permission.CAMERA
     )
 
     private lateinit var uiDevice: UiDevice
     private lateinit var instrumentation: Instrumentation
-    private val results = mutableListOf<EvaluationResult>()
+    private lateinit var testDataManager: TestDataManager
+    private lateinit var ocrHelper: OcrHelper
+
     private val tag = "KeyboardEvaluator"
     private val editTextResId = "com.example.androidinstrumentedtest:id/evaluation_edit_text"
-    private lateinit var testDataManager: TestDataManager
-
-    private var keyboardMode: String = "9键测试"
+    private var keyboardMode: String = "9-key"
     private val manualPositions = mutableMapOf<String, Rect>()
+    private val results = mutableListOf<EvaluationResult>()
     private lateinit var debugDir: File
-    
-    /**
-     * 常见 OCR 误识别纠正映射表
-     * 基于 ML Kit 中文 OCR 的常见错误进行手动纠正
-     * 格式: 错误识别 -> 正确字符的列表（按概率排序）
-     */
-    private val ocrErrorCorrections = mapOf(
-        "費" to listOf("费"),      // 繁体费 -> 简体费
-        "鎖" to listOf("锁"),      // 繁体锁 -> 简体锁
-    )
-    
-    private val recognizer by lazy {
-        // ML Kit 16.0.0 版本默认支持简体中文
-        // 如果 OCR 识别出繁体字，后续会通过 convertTraditionalToSimplified 转换
-        TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
-    }
 
     @Before
     fun setup() {
         instrumentation = InstrumentationRegistry.getInstrumentation()
         uiDevice = UiDevice.getInstance(instrumentation)
-        @Suppress("DEPRECATION")
         uiDevice.setCompressedLayoutHeirarchy(false)
+
         testDataManager = TestDataManager(instrumentation.targetContext)
 
-        // Put debug artifacts under Documents/InstrumentedTest/test_debug
-        debugDir = testDataManager.getDebugDir()
-        if (debugDir.exists()) {
-            debugDir.deleteRecursively()
+        // 所有输出文件统一保存到 OUTPUT_DIR
+        debugDir = File(OUTPUT_DIR)
+        // 注意: @Before 会在每个 @Test 前执行。这里只在本进程首次执行时清理一次，
+        // 避免后续测试把刚生成的报告/调试文件又清掉。
+        if (!outputClearedOnce) {
+            synchronized(KeyboardEvaluationTest::class.java) {
+                if (!outputClearedOnce) {
+                    clearOutputDir()
+                    outputClearedOnce = true
+                    Log.i(tag, "🧹 Output dir cleared once at test process start")
+                }
+            }
         }
-        debugDir.mkdirs()
-        Log.i(tag, "调试目录: ${debugDir.absolutePath}")
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            debugDir.mkdirs()
+        }
+        Log.i(tag, "📁 Output dir: ${debugDir.absolutePath}")
+        Log.i(tag, "📁 Output authorization: ${OutputDirectoryManager.buildStatusText(instrumentation.targetContext)}")
+
+        ocrHelper = OcrHelper(
+            runtimeContext = instrumentation.targetContext,
+            assetContext = instrumentation.context
+        )
+        ocrHelper.initEngine()
 
         val prefs = instrumentation.targetContext.getSharedPreferences("KeyboardEvaluatorPrefs", Context.MODE_PRIVATE)
-        keyboardMode = prefs.getString("last_keyboard_type", "9键测试") ?: "9键测试"
-        Log.i(tag, "检测到测试模式: $keyboardMode")
-
+        keyboardMode = prefs.getString("last_keyboard_type", "9-key") ?: "9-key"
         loadManualCalibrationData()
 
         activityRule.launchActivity(
@@ -100,6 +113,947 @@ class KeyboardEvaluationTest {
                 putExtra(MainActivity.EXTRA_IS_TEST_MODE, true)
             }
         )
+        Log.i(tag, "Setup complete. mode=$keyboardMode")
+    }
+
+    @Test
+    fun runKeyboardEvaluation() {
+        Log.i(tag, "=== runKeyboardEvaluation START ===")
+        val testData = testDataManager.readTestData { errorMessage ->
+            Log.e(tag, errorMessage)
+            activityRule.activity.runOnUiThread {
+                activityRule.activity.setReportText(errorMessage, Color.RED)
+            }
+        }
+        if (testData.isEmpty()) {
+            val msg = "测试数据为空或读取失败，评测已中止"
+            Log.e(tag, msg)
+            throw AssertionError(msg)
+        }
+
+        val edit = findSafeEditText(5000)
+        if (edit == null) {
+            Log.w(tag, "UiAutomator 未找到 evaluation_edit_text，尝试 Activity fallback")
+            val fallbackOk = prepareEditTextFallback(clearText = true)
+            if (!fallbackOk) {
+                val msg = "未找到 evaluation_edit_text，评测已中止"
+                Log.e(tag, msg)
+                throw AssertionError(msg)
+            }
+        } else {
+            edit.click()
+        }
+        Thread.sleep(500)
+
+        testData.forEachIndexed { i, pair ->
+            val pinyin = pair.first
+            val target = pair.second
+            val result = EvaluationResult(pinyin, target)
+
+            runCandidateAreaEvaluation(result, target, pinyin)
+            results.add(result)
+            sendPartialReport(result)
+            Log.i(tag, "[$i] $pinyin -> $target, found=${result.wasFound}, pos=${result.selectedNo}")
+            Thread.sleep(400)
+        }
+        Log.i(tag, "=== runKeyboardEvaluation END ===")
+    }
+
+    @After
+    fun generateReport() {
+        if (results.isEmpty()) {
+            Log.w(tag, "generateReport skipped: results is empty")
+            return
+        }
+        val report = buildFinalReport()
+        
+        // 保存报告到 OUTPUT_DIR 根目录，并额外复制一份到 failed_tests 子目录
+        val timestamp = SimpleDateFormat("yyyy-MM-dd_HHmmss", Locale.getDefault()).format(Date())
+        val reportFile = File(debugDir, "evaluation_report_${timestamp}.txt")
+        val rootSaved = writeTextFile(reportFile, report)
+        if (rootSaved) Log.i(tag, "✓ Report saved: ${reportFile.absolutePath}") else Log.e(tag, "✗ Report save failed: ${reportFile.absolutePath}")
+
+        val failedDir = File(debugDir, "failed_tests").apply { mkdirs() }
+        val failedReportFile = File(failedDir, "evaluation_report_${timestamp}.txt")
+        val failedSaved = writeTextFile(failedReportFile, report)
+        if (failedSaved) Log.i(tag, "✓ Report copy saved: ${failedReportFile.absolutePath}") else Log.e(tag, "✗ Report copy save failed: ${failedReportFile.absolutePath}")
+
+        logOutputDirectorySummary()
+        
+        activityRule.activity.runOnUiThread {
+            val msg = when {
+                failedSaved -> "Done: ${failedReportFile.absolutePath}"
+                rootSaved -> "Done: ${reportFile.absolutePath}"
+                else -> "❌ 报告保存失败，请查看 Logcat: $tag"
+            }
+            activityRule.activity.setReportText(msg, Color.parseColor("#006400"))
+        }
+    }
+
+    private fun runCandidateAreaEvaluation(result: EvaluationResult, target: String, pinyin: String) {
+        try {
+            Log.i(tag, "➤ [${result.pinyinSequence}] START EVALUATION for target='$target'")
+            
+            val et = findSafeEditText(2000)
+            if (et == null) {
+                Log.w(tag, "   EditText not found by UiAutomator, use Activity fallback")
+                if (!prepareEditTextFallback(clearText = true)) {
+                    result.message = "ERROR: EditText not found"
+                    Log.e(tag, "   EditText not found within 2000ms")
+                    return
+                }
+            }
+            clearTextViaDelete(et)
+
+            pinyin.forEach {
+                pressKeyInternal(it)
+                Thread.sleep(90)
+            }
+            Log.d(tag, "   Input completed: $pinyin")
+            Thread.sleep(1000)
+
+            val candidateBitmap = captureCandidateAreaBitmap() ?: run {
+                result.message = "ERROR: candidate_area not calibrated"
+                Log.e(tag, "   candidate_area calibration missing!")
+                return
+            }
+            Log.d(tag, "   Captured candidate area: ${candidateBitmap.width}x${candidateBitmap.height}")
+
+            val ocrResult = runOcrSingleLineInOrder(candidateBitmap)
+            val tokens = ocrResult.tokens
+            result.attempts.addAll(tokens)
+            Log.d(tag, "   OCR tokens: ${tokens.size} candidates")
+            tokens.forEachIndexed { idx, token ->
+                Log.d(tag, "     [$idx] '$token'")
+            }
+
+            val hitIndex = tokens.indexOfFirst { matchCandidateWord(it, target) }
+            when {
+                hitIndex == 0 -> {
+                    result.wasFound = true
+                    result.selectedNo = 1
+                    result.selectedWord = target.trim()
+                    result.message = "Top1"
+                    Log.i(tag, "   ✅ SUCCESS: Top 1 match!")
+                }
+                hitIndex > 0 -> {
+                    result.wasFound = true
+                    result.selectedNo = hitIndex + 1
+                    result.selectedWord = target.trim()
+                    result.message = "FIRST_LINE_MATCH"
+                    Log.i(tag, "   ✅ SUCCESS: First line match at position ${"%-2d".format(hitIndex + 1)}")
+                }
+                else -> {
+                    result.wasFound = false
+                    result.selectedNo = 0
+                    result.message = "NOT_FOUND"
+                    Log.e(tag, "   ❌ FAILED: NOT_FOUND - target '$target' not in candidates")
+                    saveFailedTestDebugInfo(pinyin, target, candidateBitmap, tokens, ocrResult.rawText)
+                }
+            }
+
+            clearTextViaDelete(findSafeEditText(500))
+            Log.i(tag, "   END: ${result.message}\n")
+            
+        } catch (e: Exception) {
+            Log.e(tag, "Evaluation error", e)
+            result.message = "ERROR: ${e.message}"
+        }
+    }
+
+    private fun runOcrSingleLineInOrder(bitmap: Bitmap): OcrResult {
+        Log.d(tag, "===== OCR: ${bitmap.width}x${bitmap.height} =====")
+
+        // 1. 分割候选词区域
+        val rects = splitByVerticalWhitespaceAdaptive(bitmap)
+        Log.d(tag, "Segmented into ${rects.size} blocks")
+
+        if (rects.isEmpty()) {
+            Log.w(tag, "No segments found")
+            return OcrResult("", emptyList())
+        }
+
+        // 2. 对每个块分别做 OCR
+        val candidates = mutableListOf<String>()
+        rects.forEachIndexed { i, rect ->
+            try {
+                val w = (rect.right - rect.left).coerceAtLeast(1)
+                val h = (rect.bottom - rect.top).coerceAtLeast(1)
+                val block = Bitmap.createBitmap(bitmap, rect.left, rect.top, w, h)
+
+                val token = recognizeBestBlockToken(block, i)
+                Log.d(tag, "Block[$i] final token: '$token'")
+
+                if (token.isNotEmpty()) candidates.add(token)
+                block.recycle()
+            } catch (e: Exception) {
+                Log.w(tag, "Block[$i] failed: ${e.message}")
+            }
+        }
+
+        Log.d(tag, "Candidates: $candidates")
+        return OcrResult(rawText = candidates.joinToString(" "), tokens = candidates)
+    }
+
+    private fun recognizeBestBlockToken(block: Bitmap, index: Int): String {
+        val attempts = mutableListOf<Pair<String, Bitmap>>()
+        val generated = mutableListOf<Bitmap>()
+
+        val padded = addWhitePadding(block, padX = 24, padY = 12)
+        generated.add(padded)
+        val padded2x = scaleBitmap(padded, 2f)
+        generated.add(padded2x)
+        val padded3x = scaleBitmap(padded, 3f)
+        generated.add(padded3x)
+        val enhanced = toBinaryHighContrast(padded2x)
+        generated.add(enhanced)
+
+        attempts.add("base" to block)
+        attempts.add("padded" to padded)
+        attempts.add("padded2x" to padded2x)
+        attempts.add("padded3x" to padded3x)
+        attempts.add("binary2x" to enhanced)
+
+        var best = ""
+        var bestScore = Int.MIN_VALUE
+
+        attempts.forEach { (name, bmp) ->
+            val raw = runBlocking { ocrHelper.recognizeText(bmp) }.text.trim()
+            val normalized = normalizeChineseToken(raw)
+            val score = scoreChineseToken(raw, normalized)
+            Log.d(tag, "Block[$index][$name] raw='$raw' normalized='$normalized' score=$score")
+            if (score > bestScore) {
+                bestScore = score
+                best = normalized
+            }
+        }
+
+        generated.forEach { it.recycle() }
+        return best
+    }
+
+    private fun normalizeChineseToken(raw: String): String {
+        if (raw.isBlank()) return ""
+        val noSpaces = raw.replace(" ", "").replace("\n", "")
+        // 候选词只保留中文，去掉误识别的拉丁字母/符号。
+        return noSpaces.filter { ch -> ch.code in 0x4E00..0x9FFF }
+    }
+
+    private fun scoreChineseToken(raw: String, normalized: String): Int {
+        if (normalized.isEmpty()) return Int.MIN_VALUE / 2
+        val chineseCount = normalized.length
+        val rawLen = raw.length.coerceAtLeast(1)
+        val chineseRatio = (chineseCount * 100) / rawLen
+        // 优先更长的中文结果，同时奖励“中文占比高”的结果。
+        return chineseCount * 100 + chineseRatio
+    }
+
+    private fun addWhitePadding(src: Bitmap, padX: Int, padY: Int): Bitmap {
+        val outW = src.width + padX * 2
+        val outH = src.height + padY * 2
+        val out = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+        out.eraseColor(Color.WHITE)
+        val canvas = android.graphics.Canvas(out)
+        canvas.drawBitmap(src, padX.toFloat(), padY.toFloat(), null)
+        return out
+    }
+
+    private fun scaleBitmap(src: Bitmap, scale: Float): Bitmap {
+        val w = (src.width * scale).toInt().coerceAtLeast(1)
+        val h = (src.height * scale).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(src, w, h, true)
+    }
+
+    private fun toBinaryHighContrast(src: Bitmap): Bitmap {
+        val w = src.width
+        val h = src.height
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val threshold = 190
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val p = src.getPixel(x, y)
+                val lum = (Color.red(p) * 299 + Color.green(p) * 587 + Color.blue(p) * 114) / 1000
+                out.setPixel(x, y, if (lum < threshold) Color.BLACK else Color.WHITE)
+            }
+        }
+        return out
+    }
+
+    private fun saveBitmapPng(bitmap: Bitmap, file: File): Boolean {
+        return writeOutputFile(file, "image/png") { out ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 95, out)
+        }
+    }
+
+    private fun writeTextFile(file: File, content: String): Boolean {
+        return writeOutputFile(file, "text/plain") { out ->
+            out.write(content.toByteArray(Charsets.UTF_8))
+            true
+        }
+    }
+
+    private fun writeOutputFile(file: File, mimeType: String, writer: (OutputStream) -> Boolean): Boolean {
+        return try {
+            val data = ByteArrayOutputStream().use { buffer ->
+                if (!writer(buffer)) return false
+                buffer.toByteArray()
+            }
+
+            val context = instrumentation.targetContext
+            if (OutputDirectoryManager.hasAuthorizedDirectory(context)) {
+                val relativePath = toRelativeOutputPath(file)
+                if (relativePath.isBlank()) {
+                    Log.e(tag, "Failed to resolve relative output path for ${file.absolutePath}")
+                    return false
+                }
+                val success = OutputDirectoryManager.writeBytes(context, relativePath, mimeType, data)
+                if (!success) {
+                    Log.e(tag, "SAF write failed: $relativePath")
+                }
+                success
+            } else if (isPublicOutputTarget(file) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                writeOutputFileViaMediaStore(file, mimeType, data)
+            } else {
+                file.parentFile?.mkdirs()
+                file.outputStream().use { out ->
+                    out.write(data)
+                    out.flush()
+                }
+                true
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to save file ${file.absolutePath}: ${e.message}")
+            false
+        }
+    }
+
+    private fun isPublicOutputTarget(file: File): Boolean {
+        val normalizedRoot = OUTPUT_DIR.removeSuffix("/").replace('\\', '/')
+        val normalizedPath = file.absolutePath.replace('\\', '/')
+        return normalizedPath == normalizedRoot || normalizedPath.startsWith("$normalizedRoot/")
+    }
+
+    private fun writeOutputFileViaMediaStore(
+        file: File,
+        mimeType: String,
+        data: ByteArray
+    ): Boolean {
+        val relativePath = buildMediaStoreRelativePath(file)
+        val resolver = instrumentation.targetContext.contentResolver
+        val collection = MediaStore.Files.getContentUri("external")
+
+        deleteExistingMediaStoreFile(collection, resolver, file.name, relativePath)
+
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
+            put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+
+        val uri = resolver.insert(collection, values)
+            ?: throw IllegalStateException("MediaStore insert returned null for ${file.name}")
+
+        try {
+            val success = resolver.openOutputStream(uri)?.use { out ->
+                out.write(data)
+                out.flush()
+                true
+            } ?: false
+            if (!success) {
+                resolver.delete(uri, null, null)
+                return false
+            }
+            values.clear()
+            values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+            return true
+        } catch (e: Exception) {
+            resolver.delete(uri, null, null)
+            throw e
+        }
+    }
+
+    private fun buildMediaStoreRelativePath(file: File): String {
+        val normalizedRoot = OUTPUT_DIR.removeSuffix("/").replace('\\', '/')
+        val normalizedPath = file.absolutePath.replace('\\', '/')
+        val relativeFilePath = normalizedPath.removePrefix(normalizedRoot).trimStart('/')
+        val childDir = relativeFilePath.substringBeforeLast('/', "")
+        val baseDir = "${Environment.DIRECTORY_DOCUMENTS}/InstrumentedTest"
+        return if (childDir.isBlank()) "$baseDir/" else "$baseDir/$childDir/"
+    }
+
+    private fun deleteExistingMediaStoreFile(
+        collection: android.net.Uri,
+        resolver: android.content.ContentResolver,
+        displayName: String,
+        relativePath: String
+    ) {
+        val projection = arrayOf(MediaStore.MediaColumns._ID)
+        val selection = "${MediaStore.MediaColumns.DISPLAY_NAME}=? AND ${MediaStore.MediaColumns.RELATIVE_PATH}=?"
+        val args = arrayOf(displayName, relativePath)
+        resolver.query(collection, projection, selection, args, null)?.use { cursor ->
+            val idIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+            while (cursor.moveToNext()) {
+                val id = cursor.getLong(idIndex)
+                val itemUri = MediaStore.Files.getContentUri("external", id)
+                resolver.delete(itemUri, null, null)
+            }
+        }
+    }
+
+    private fun clearOutputDir() {
+        try {
+            if (OutputDirectoryManager.hasAuthorizedDirectory(instrumentation.targetContext)) {
+                OutputDirectoryManager.clearAuthorizedOutput(instrumentation.targetContext)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                clearOutputDirViaMediaStore()
+            } else if (debugDir.exists()) {
+                debugDir.deleteRecursively()
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to clear output dir ${debugDir.absolutePath}: ${e.message}")
+        }
+    }
+
+    private fun toRelativeOutputPath(file: File): String {
+        val normalizedRoot = OUTPUT_DIR.removeSuffix("/").replace('\\', '/')
+        val normalizedPath = file.absolutePath.replace('\\', '/')
+        return normalizedPath.removePrefix(normalizedRoot).trimStart('/')
+    }
+
+    private fun logOutputDirectorySummary() {
+        val context = instrumentation.targetContext
+        if (OutputDirectoryManager.hasAuthorizedDirectory(context)) {
+            val files = OutputDirectoryManager.listAuthorizedOutputFiles(context)
+            Log.i(tag, "📂 Authorized output summary (${files.size} items)")
+            files.forEach { Log.i(tag, "   • $it") }
+        } else {
+            Log.i(tag, "📂 Output summary fallback path: ${debugDir.absolutePath}")
+        }
+    }
+
+    private fun clearOutputDirViaMediaStore() {
+        val resolver = instrumentation.targetContext.contentResolver
+        val collection = MediaStore.Files.getContentUri("external")
+        val projection = arrayOf(MediaStore.MediaColumns._ID)
+        val relativePrefix = "${Environment.DIRECTORY_DOCUMENTS}/InstrumentedTest/%"
+        val rootRelativePath = "${Environment.DIRECTORY_DOCUMENTS}/InstrumentedTest/"
+        val selection = "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? OR ${MediaStore.MediaColumns.RELATIVE_PATH}=?"
+        val args = arrayOf(relativePrefix, rootRelativePath)
+
+        resolver.query(collection, projection, selection, args, null)?.use { cursor ->
+            val idIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+            while (cursor.moveToNext()) {
+                val id = cursor.getLong(idIndex)
+                val itemUri = MediaStore.Files.getContentUri("external", id)
+                resolver.delete(itemUri, null, null)
+            }
+        }
+    }
+
+    private fun logBitmapDiagnostics(bitmap: Bitmap, label: String) {
+        try {
+            val width = bitmap.width
+            val height = bitmap.height
+            val pixels = IntArray(width * height)
+            bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+            
+            // Calculate multiple metrics
+            var darkPixels = 0      // lum < 100
+            var brightPixels = 0    // lum > 200
+            var totalLum = 0L
+            var redPixels = 0       // R > 150 && R > G+50 && R > B+50
+            var greenPixels = 0     // G > 150 && G > R+50
+            var orangePixels = 0    // R > 180 && G > 100 && G < 180 && B < 100
+            
+            for (pixel in pixels) {
+                val r = Color.red(pixel)
+                val g = Color.green(pixel)
+                val b = Color.blue(pixel)
+                val lum = (r * 299 + g * 587 + b * 114) / 1000
+                
+                totalLum += lum
+                if (lum < 100) darkPixels++
+                if (lum > 200) brightPixels++
+                
+                // Detect colored pixels
+                if (r > 150 && r > g + 50 && r > b + 50) redPixels++
+                if (g > 150 && g > r + 50) greenPixels++
+                if (r > 180 && g > 100 && g < 180 && b < 100) orangePixels++
+            }
+            
+            val avgLum = totalLum / pixels.size
+            val darkRatio = (darkPixels * 100.0) / pixels.size
+            val brightRatio = (brightPixels * 100.0) / pixels.size
+            val redRatio = (redPixels * 100.0) / pixels.size
+            val orangeRatio = (orangePixels * 100.0) / pixels.size
+            
+            Log.d(tag, "$label: size=${width}x${height} avg_lum=${avgLum} dark%=${"%.1f".format(darkRatio)} bright%=${"%.1f".format(brightRatio)}")
+            Log.d(tag, "$label: color_detect red%=${"%.1f".format(redRatio)} orange%=${"%.1f".format(orangeRatio)}")
+            
+            // Log color-aware visualization
+            val sampleHeight = Math.min(3, height)
+            for (y in 0 until sampleHeight) {
+                val row = StringBuilder()
+                for (x in 0 until width step Math.max(1, width / 40)) {
+                    val pixel = bitmap.getPixel(x, y)
+                    val r = Color.red(pixel)
+                    val g = Color.green(pixel)
+                    val b = Color.blue(pixel)
+                    val lum = (r * 299 + g * 587 + b * 114) / 1000
+                    
+                    val ch = when {
+                        r > 150 && r > g + 50 && r > b + 50 -> "R"  // Red
+                        g > 100 && r > 100 && b < 100 -> "O"        // Orange
+                        g > 150 && g > r + 50 -> "G"                // Green
+                        lum < 50 -> "█"
+                        lum < 100 -> "▓"
+                        lum < 150 -> "▒"
+                        lum < 200 -> "░"
+                        else -> " "
+                    }
+                    row.append(ch)
+                }
+                Log.d(tag, "$label row[$y]: $row")
+            }
+            
+        } catch (e: Exception) {
+            Log.w(tag, "logBitmapDiagnostics error: ${e.message}")
+        }
+    }
+
+    private fun runOcrRawText(bitmap: Bitmap): String {
+        return try {
+            val r = runBlocking { ocrHelper.recognizeText(bitmap) }
+            if (r.success) r.text else ""
+        } catch (e: Exception) {
+            Log.e(tag, "runOcrRawText error", e)
+            ""
+        }
+    }
+
+    // DISABLED: enhanceImageContrast - removed to test raw image OCR without enhancement
+    // private fun enhanceImageContrast(bitmap: Bitmap): Bitmap {
+    //     val width = bitmap.width
+    //     val height = bitmap.height
+    //     val pixels = IntArray(width * height)
+    //     bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+    //
+    //     val histogram = IntArray(256)
+    //     for (pixel in pixels) {
+    //         val lum = (Color.red(pixel) * 299 + Color.green(pixel) * 587 + Color.blue(pixel) * 114) / 1000
+    //         histogram[lum]++
+    //     }
+    //
+    //     val cumulative = IntArray(256)
+    //     cumulative[0] = histogram[0]
+    //     for (i in 1 until 256) cumulative[i] = cumulative[i - 1] + histogram[i]
+    //
+    //     val lut = IntArray(256)
+    //     val pixelCount = width * height
+    //     for (i in 0 until 256) {
+    //         lut[i] = ((cumulative[i].toLong() * 255) / pixelCount).toInt().coerceIn(0, 255)
+    //     }
+    //
+    //     val out = IntArray(pixels.size)
+    //     val contrast = 1.4f
+    //     for (i in pixels.indices) {
+    //         val p = pixels[i]
+    //         val nr = ((lut[Color.red(p)] - 128) * contrast + 128).toInt().coerceIn(0, 255)
+    //         val ng = ((lut[Color.green(p)] - 128) * contrast + 128).toInt().coerceIn(0, 255)
+    //         val nb = ((lut[Color.blue(p)] - 128) * contrast + 128).toInt().coerceIn(0, 255)
+    //         out[i] = Color.argb(255, nr, ng, nb)
+    //     }
+    //
+    //     val enhanced = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    //     enhanced.setPixels(out, 0, width, 0, 0, width, height)
+    //     return enhanced
+    // }
+
+    private fun splitByVerticalWhitespaceAdaptive(bitmap: Bitmap): List<Rect> {
+        val width = bitmap.width
+        val height = bitmap.height
+        if (width <= 2 || height <= 2) return emptyList()
+
+        // 候选词栏只有一行：先找到真实文字带，避免整图噪声干扰列分割。
+        val darkThreshold = 210
+        val textBand = detectSingleLineTextBand(bitmap, darkThreshold)
+        val bandTop = textBand.first
+        val bandBottom = textBand.second
+        val bandHeight = (bandBottom - bandTop + 1).coerceAtLeast(1)
+
+        val colInk = buildColumnInk(bitmap, bandTop, bandBottom, darkThreshold)
+
+        val smoothed = IntArray(width)
+        val radius = 1
+        for (x in 0 until width) {
+            var sum = 0
+            var n = 0
+            for (k in -radius..radius) {
+                val xx = x + k
+                if (xx in 0 until width) {
+                    sum += colInk[xx]
+                    n++
+                }
+            }
+            smoothed[x] = if (n > 0) sum / n else colInk[x]
+        }
+
+        val inkThreshold = (bandHeight * 0.06f).toInt().coerceAtLeast(2)
+        val inkRuns = mutableListOf<IntRange>()
+        var start = -1
+        for (x in 0 until width) {
+            if (smoothed[x] >= inkThreshold) {
+                if (start < 0) start = x
+            } else if (start >= 0) {
+                inkRuns.add(start..(x - 1))
+                start = -1
+            }
+        }
+        if (start >= 0) inkRuns.add(start..(width - 1))
+        if (inkRuns.isEmpty()) return emptyList()
+
+        // 先把非常窄的小碎块并到邻居，减少抗锯齿引起的过切。
+        val minTinyRun = (width * 0.006f).toInt().coerceAtLeast(3)
+        val compactRuns = mutableListOf<IntRange>()
+        inkRuns.forEach { run ->
+            val runW = run.last - run.first + 1
+            if (compactRuns.isEmpty()) {
+                compactRuns.add(run)
+            } else {
+                val prev = compactRuns.last()
+                val gap = run.first - prev.last - 1
+                if (runW <= minTinyRun && gap <= 10) {
+                    compactRuns[compactRuns.lastIndex] = prev.first..run.last
+                } else {
+                    compactRuns.add(run)
+                }
+            }
+        }
+
+        if (compactRuns.size <= 1) {
+            val valleyRuns = splitSingleRunByValleys(smoothed)
+            if (valleyRuns.isEmpty()) return emptyList()
+            return runsToRects(valleyRuns, width, height, bandTop, bandBottom)
+        }
+
+        val gaps = mutableListOf<Int>()
+        for (i in 0 until compactRuns.size - 1) {
+            gaps.add((compactRuns[i + 1].first - compactRuns[i].last - 1).coerceAtLeast(0))
+        }
+
+        val splitThreshold = calcAdaptiveSplitThreshold(gaps).coerceAtLeast(10)
+        val wordRuns = mutableListOf<IntRange>()
+        var curRun = compactRuns[0]
+        for (i in 1 until compactRuns.size) {
+            val next = compactRuns[i]
+            val gap = next.first - curRun.last - 1
+            if (gap >= splitThreshold) {
+                wordRuns.add(curRun)
+                curRun = next
+            } else {
+                curRun = curRun.first..next.last
+            }
+        }
+        wordRuns.add(curRun)
+
+        return runsToRects(wordRuns, width, height, bandTop, bandBottom)
+    }
+
+    private fun runsToRects(runs: List<IntRange>, width: Int, height: Int, bandTop: Int, bandBottom: Int): List<Rect> {
+        val minRunWidth = (width * 0.015f).toInt().coerceAtLeast(6)
+        val padX = 4
+        val padY = 3
+        return runs
+            .filter { (it.last - it.first + 1) >= minRunWidth }
+            .map { run ->
+                val left = (run.first - padX).coerceAtLeast(0)
+                val right = (run.last + padX + 1).coerceAtMost(width)
+                val top = (bandTop - padY).coerceAtLeast(0)
+                val bottom = (bandBottom + padY + 1).coerceAtMost(height)
+                Rect(left, top, right, bottom)
+            }
+    }
+
+    private fun detectSingleLineTextBand(bitmap: Bitmap, darkThreshold: Int): Pair<Int, Int> {
+        val width = bitmap.width
+        val height = bitmap.height
+        val rowInk = IntArray(height)
+        for (y in 0 until height) {
+            var cnt = 0
+            for (x in 0 until width) {
+                val p = bitmap.getPixel(x, y)
+                val lum = (Color.red(p) * 299 + Color.green(p) * 587 + Color.blue(p) * 114) / 1000
+                if (lum < darkThreshold) cnt++
+            }
+            rowInk[y] = cnt
+        }
+
+        val rowThreshold = (width * 0.01f).toInt().coerceAtLeast(2)
+        var top = -1
+        var bottom = -1
+        for (y in 0 until height) {
+            if (rowInk[y] >= rowThreshold) {
+                if (top < 0) top = y
+                bottom = y
+            }
+        }
+        if (top < 0 || bottom < 0) return 0 to (height - 1)
+
+        top = (top - 2).coerceAtLeast(0)
+        bottom = (bottom + 2).coerceAtMost(height - 1)
+        return top to bottom
+    }
+
+    private fun buildColumnInk(bitmap: Bitmap, top: Int, bottom: Int, darkThreshold: Int): IntArray {
+        val width = bitmap.width
+        val colInk = IntArray(width)
+        for (x in 0 until width) {
+            var cnt = 0
+            for (y in top..bottom) {
+                val p = bitmap.getPixel(x, y)
+                val lum = (Color.red(p) * 299 + Color.green(p) * 587 + Color.blue(p) * 114) / 1000
+                if (lum < darkThreshold) cnt++
+            }
+            colInk[x] = cnt
+        }
+        return colInk
+    }
+
+    private fun splitSingleRunByValleys(colInk: IntArray): List<IntRange> {
+        if (colInk.isEmpty()) return emptyList()
+        val width = colInk.size
+        val minInk = colInk.minOrNull() ?: 0
+        val maxInk = colInk.maxOrNull() ?: 0
+        if (maxInk - minInk < 3) return emptyList()
+
+        val valleyThreshold = (minInk + (maxInk - minInk) * 0.28f).toInt()
+        val minGapWidth = (width * 0.006f).toInt().coerceAtLeast(2)
+
+        val boundaries = mutableListOf<Int>()
+        var s = -1
+        for (x in 0 until width) {
+            if (colInk[x] <= valleyThreshold) {
+                if (s < 0) s = x
+            } else if (s >= 0) {
+                val e = x - 1
+                if (e - s + 1 >= minGapWidth) boundaries.add((s + e) / 2)
+                s = -1
+            }
+        }
+        if (s >= 0) {
+            val e = width - 1
+            if (e - s + 1 >= minGapWidth) boundaries.add((s + e) / 2)
+        }
+
+        if (boundaries.isEmpty()) {
+            val prominence = ((maxInk - minInk) * 0.20f).toInt().coerceAtLeast(2)
+            var last = -9999
+            for (x in 1 until width - 1) {
+                val v = colInk[x]
+                if (v <= colInk[x - 1] && v <= colInk[x + 1]) {
+                    val neigh = maxOf(colInk[x - 1], colInk[x + 1])
+                    if (neigh - v >= prominence && x - last >= minGapWidth * 2) {
+                        boundaries.add(x)
+                        last = x
+                    }
+                }
+            }
+        }
+
+        if (boundaries.isEmpty()) return emptyList()
+
+        val minWordWidth = (width * 0.02f).toInt().coerceAtLeast(8)
+        val runs = mutableListOf<IntRange>()
+        var left = 0
+        boundaries.sorted().forEach { b ->
+            val right = b - 1
+            if (right - left + 1 >= minWordWidth) runs.add(left..right)
+            left = b + 1
+        }
+        if (width - left >= minWordWidth) runs.add(left..(width - 1))
+        return runs
+    }
+
+    private fun calcAdaptiveSplitThreshold(gaps: List<Int>): Int {
+        if (gaps.isEmpty()) return Int.MAX_VALUE
+        if (gaps.size == 1) return (gaps[0] + 1).coerceAtLeast(8)
+
+        val sorted = gaps.sorted()
+        var bestJump = Int.MIN_VALUE
+        var bestIdx = -1
+        for (i in 0 until sorted.size - 1) {
+            val jump = sorted[i + 1] - sorted[i]
+            if (jump > bestJump) {
+                bestJump = jump
+                bestIdx = i
+            }
+        }
+        if (bestIdx >= 0 && bestJump >= 3) {
+            return ((sorted[bestIdx] + sorted[bestIdx + 1]) / 2).coerceAtLeast(4)
+        }
+
+        val mean = sorted.average()
+        val variance = sorted.map { (it - mean) * (it - mean) }.average()
+        val stdDev = sqrt(variance)
+        if (stdDev > mean * 0.2f) {
+            return (mean + stdDev).toInt().coerceAtLeast(4)
+        }
+
+        val median = sorted[sorted.size / 2]
+        val q1 = sorted[(sorted.size / 4).coerceAtMost(sorted.size - 1)]
+        val q3 = sorted[((sorted.size * 3) / 4).coerceAtMost(sorted.size - 1)]
+        val iqr = q3 - q1
+        if (iqr > 1) {
+            return (median + iqr).coerceAtLeast(q3).coerceAtLeast(4)
+        }
+
+        if (stdDev <= 0.01f * mean) {
+            return (sorted.first().coerceAtLeast(1) - 1).coerceAtLeast(1)
+        }
+
+        return (sorted.last() + 1).coerceAtLeast(4)
+    }
+
+    // DISABLED: normalizeOcrToken - removed to test raw OCR results
+    // private fun normalizeOcrToken(raw: String): String {
+    //     // Just trim the raw result without any cleanup
+    //     return raw.trim()
+    // }
+
+    private fun contextualCorrection(corrected: String): String {
+        var result = corrected
+        result = result.replace("黑社杜", "黑社会")
+        return result
+    }
+
+    private fun matchCandidateWord(candidate: String, target: String): Boolean {
+        return candidate.trim() == target.trim()
+    }
+
+    private fun findSafeEditText(timeout: Long = 2000): UiObject2? {
+        val byFull = uiDevice.wait(Until.findObject(By.res(editTextResId)), timeout)
+        if (byFull != null) return byFull
+
+        val byPkg = uiDevice.wait(
+            Until.findObject(By.res("com.example.androidinstrumentedtest", "evaluation_edit_text")),
+            timeout / 2
+        )
+        if (byPkg != null) return byPkg
+
+        return uiDevice.wait(Until.findObject(By.res("evaluation_edit_text")), timeout / 2)
+    }
+
+    private fun prepareEditTextFallback(clearText: Boolean): Boolean {
+        val latch = CountDownLatch(1)
+        var ok = false
+        activityRule.activity.runOnUiThread {
+            try {
+                val et = activityRule.activity.findViewById<android.widget.EditText>(R.id.evaluation_edit_text)
+                if (et != null) {
+                    et.visibility = android.view.View.VISIBLE
+                    et.isEnabled = true
+                    et.isFocusableInTouchMode = true
+                    et.requestFocus()
+                    et.performClick()
+                    if (clearText) et.setText("")
+                    ok = true
+                }
+            } catch (_: Exception) {
+                ok = false
+            } finally {
+                latch.countDown()
+            }
+        }
+        latch.await(1500, TimeUnit.MILLISECONDS)
+        return ok
+    }
+
+    private fun captureCandidateAreaBitmap(): Bitmap? {
+        val area = manualPositions["candidate_area"] ?: return null
+        Log.d(tag, "Capturing candidate_area: ${area.left},${area.top},${area.right},${area.bottom} size=${area.right-area.left}x${area.bottom-area.top}")
+        
+        val fullShotFile = File(instrumentation.targetContext.cacheDir, "panel_full.png")
+        if (fullShotFile.exists()) fullShotFile.delete()
+        uiDevice.takeScreenshot(fullShotFile)
+        val fullBitmap = BitmapFactory.decodeFile(fullShotFile.absolutePath) ?: return null
+
+        Log.d(tag, "Full screenshot: ${fullBitmap.width}x${fullBitmap.height}")
+        
+        val left = area.left.coerceAtLeast(0)
+        val top = area.top.coerceAtLeast(0)
+        val right = area.right.coerceAtMost(fullBitmap.width)
+        val bottom = area.bottom.coerceAtMost(fullBitmap.height)
+        val w = (right - left).coerceAtLeast(1)
+        val h = (bottom - top).coerceAtLeast(1)
+        
+        Log.d(tag, "Crop: left=$left top=$top right=$right bottom=$bottom → ${w}x${h}")
+        
+        val cropped = Bitmap.createBitmap(fullBitmap, left, top, w, h)
+        
+        // Save full screenshot for debugging
+        val fullFile = File(debugDir, "full_screenshot.png")
+        saveBitmapPng(fullBitmap, fullFile)
+        Log.d(tag, "Saved full screenshot: ${fullFile.absolutePath}")
+        
+        return cropped
+    }
+
+    private fun clearTextViaDelete(et: UiObject2?) {
+        if (et == null) {
+            prepareEditTextFallback(clearText = true)
+            return
+        }
+        et.click()
+        Thread.sleep(200)
+        val text = et.text ?: ""
+        val committedLen = if (text.isNotEmpty() && text.uppercase() != "PINYIN WILL BE ENTERED HERE") text.length else 0
+        repeat(committedLen + 15) {
+            instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_DEL)
+            Thread.sleep(20)
+        }
+        Thread.sleep(200)
+    }
+
+    private fun pressKeyInternal(key: Char) {
+        val keyChar = key.lowercaseChar()
+        val targetKeyStr = when (keyboardMode) {
+            "9键测试", "9-key" -> when (keyChar) {
+                'a', 'b', 'c' -> "2"
+                'd', 'e', 'f' -> "3"
+                'g', 'h', 'i' -> "4"
+                'j', 'k', 'l' -> "5"
+                'm', 'n', 'o' -> "6"
+                'p', 'q', 'r', 's' -> "7"
+                't', 'u', 'v' -> "8"
+                'w', 'x', 'y', 'z' -> "9"
+                ' ' -> "0"
+                else -> keyChar.toString()
+            }
+            "14键测试", "14-key" -> when (keyChar) {
+                'q', 'w' -> "qw"
+                'e', 'r' -> "er"
+                't', 'y' -> "ty"
+                'u', 'i' -> "ui"
+                'o', 'p' -> "op"
+                'a', 's' -> "as"
+                'd', 'f' -> "df"
+                'g', 'h' -> "gh"
+                'j', 'k' -> "jk"
+                'z', 'x' -> "zx"
+                'c', 'v' -> "cv"
+                'b', 'n' -> "bn"
+                ' ' -> "space"
+                else -> keyChar.toString()
+            }
+            else -> if (keyChar == ' ') "space" else keyChar.toString()
+        }
+
+        manualPositions[targetKeyStr]?.let {
+            uiDevice.click(it.centerX(), it.centerY())
+            Thread.sleep(50)
+        } ?: Log.w(tag, "No calibration for key: $targetKeyStr")
     }
 
     private fun loadManualCalibrationData() {
@@ -108,758 +1062,79 @@ class KeyboardEvaluationTest {
             val dataDir = File(mainAppContext.filesDir, "InstrumentedTest")
             val prefs = instrumentation.targetContext.getSharedPreferences("KeyboardEvaluatorPrefs", Context.MODE_PRIVATE)
             val calFileName = prefs.getString("last_calibration_file", "")
+            if (calFileName.isNullOrEmpty()) return
 
-            if (!calFileName.isNullOrEmpty()) {
-                val calibrationFile = File(dataDir, calFileName)
-                if (calibrationFile.exists()) {
-                    val json = JSONObject(calibrationFile.readText())
-                    val it = json.keys()
-                    while (it.hasNext()) {
-                        val keyStr = it.next()
-                        val point = json.getJSONObject(keyStr)
-                        val x = point.getDouble("x").toInt()
-                        val y = point.getDouble("y").toInt()
-                        if (keyStr == "candidate_area" && point.has("w") && point.has("h")) {
-                            val w = point.getDouble("w").toInt()
-                            val h = point.getDouble("h").toInt()
-                            manualPositions[keyStr] = Rect(x - w / 2, y - h / 2, x + w / 2, y + h / 2)
-                        } else {
-                            manualPositions[keyStr] = Rect(x - 5, y - 5, x + 5, y + 5)
-                            // 对于9键/14键模式，需要添加键盘模式转换映射
-                            addKeyboardModeMapping(keyStr, Rect(x - 5, y - 5, x + 5, y + 5))
-                        }
-                    }
-                    Log.i(tag, "已加载校准文件: $calFileName")
+            val calibrationFile = File(dataDir, calFileName)
+            if (!calibrationFile.exists()) return
+
+            val json = JSONObject(calibrationFile.readText())
+            val it = json.keys()
+            while (it.hasNext()) {
+                val keyStr = it.next()
+                val point = json.getJSONObject(keyStr)
+                val x = point.getDouble("x").toInt()
+                val y = point.getDouble("y").toInt()
+                if (keyStr == "candidate_area" && point.has("w") && point.has("h")) {
+                    val w = point.getDouble("w").toInt()
+                    val h = point.getDouble("h").toInt()
+                    manualPositions[keyStr] = Rect(x - w / 2, y - h / 2, x + w / 2, y + h / 2)
+                } else {
+                    val rect = Rect(x - 5, y - 5, x + 5, y + 5)
+                    manualPositions[keyStr] = rect
+                    addKeyboardModeMapping(keyStr, rect)
                 }
             }
-        } catch (e: Exception) { Log.e(tag, "加载校准数据失败", e) }
+            Log.i(tag, "Calibration loaded: $calFileName")
+        } catch (e: Exception) {
+            Log.e(tag, "Load calibration failed", e)
+        }
     }
 
-    /**
-     * 根据不同键盘模式添加按键映射
-     * 校准文件可能是26键格式，需要转换为9键/14键格式
-     */
     private fun addKeyboardModeMapping(calibKey: String, rect: Rect) {
-        // 如果校准文件是26键格式，为9键和14键模式添���映射
         when (keyboardMode) {
-            "9键测试" -> {
-                // 26键到9键的映射
-                when (calibKey) {
-                    "a", "b", "c" -> manualPositions["2"] = rect
-                    "d", "e", "f" -> manualPositions["3"] = rect
-                    "g", "h", "i" -> manualPositions["4"] = rect
-                    "j", "k", "l" -> manualPositions["5"] = rect
-                    "m", "n", "o" -> manualPositions["6"] = rect
-                    "p", "q", "r", "s" -> manualPositions["7"] = rect
-                    "t", "u", "v" -> manualPositions["8"] = rect
-                    "w", "x", "y", "z" -> manualPositions["9"] = rect
-                    " " -> manualPositions["0"] = rect
-                }
+            "9键测试", "9-key" -> when (calibKey) {
+                "a", "b", "c" -> manualPositions["2"] = rect
+                "d", "e", "f" -> manualPositions["3"] = rect
+                "g", "h", "i" -> manualPositions["4"] = rect
+                "j", "k", "l" -> manualPositions["5"] = rect
+                "m", "n", "o" -> manualPositions["6"] = rect
+                "p", "q", "r", "s" -> manualPositions["7"] = rect
+                "t", "u", "v" -> manualPositions["8"] = rect
+                "w", "x", "y", "z" -> manualPositions["9"] = rect
+                " " -> manualPositions["0"] = rect
             }
-            "14键测试" -> {
-                // 26键到14键的映射
-                when (calibKey) {
-                    "q", "w" -> manualPositions["qw"] = rect
-                    "e", "r" -> manualPositions["er"] = rect
-                    "t", "y" -> manualPositions["ty"] = rect
-                    "u", "i" -> manualPositions["ui"] = rect
-                    "o", "p" -> manualPositions["op"] = rect
-                    "a", "s" -> manualPositions["as"] = rect
-                    "d", "f" -> manualPositions["df"] = rect
-                    "g", "h" -> manualPositions["gh"] = rect
-                    "j", "k" -> manualPositions["jk"] = rect
-                    "z", "x" -> manualPositions["zx"] = rect
-                    "c", "v" -> manualPositions["cv"] = rect
-                    "b", "n" -> manualPositions["bn"] = rect
-                    " " -> manualPositions["space"] = rect
-                }
-            }
-            // 26键模式直接使用原始按键标识
-        }
-    }
-
-    private fun findSafeEditText(timeout: Long = 2000): UiObject2? {
-        return uiDevice.wait(Until.findObject(By.res(editTextResId)), timeout)
-    }
-
-    private fun clearTextViaDelete(et: UiObject2?) {
-        if (et == null) return
-        et.click(); Thread.sleep(300)
-        val text = et.text ?: ""
-        val committedLen = if (text.isNotEmpty() && text.uppercase() != "PINYIN WILL BE ENTERED HERE") text.length else 0
-        repeat(committedLen + 15) { instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_DEL); Thread.sleep(20) }
-        Thread.sleep(200)
-    }
-
-    @Test
-    fun runKeyboardEvaluation() {
-        val testData = testDataManager.readTestData { errorMessage ->
-            Log.e(tag, errorMessage)
-            activityRule.activity.runOnUiThread { activityRule.activity.setReportText(errorMessage, Color.RED) }
-        }
-        if (testData.isEmpty()) return
-
-        val initialET = findSafeEditText(5000) ?: return
-        initialET.click(); Thread.sleep(800)
-
-        activityRule.activity.runOnUiThread { activityRule.activity.setReportText("评测开始 ($keyboardMode)...", Color.BLACK) }
-
-        testData.forEachIndexed { index, dataPair ->
-            val pinyin = dataPair.first
-            val target = dataPair.second
-            val result = EvaluationResult(pinyin, target)
-
-            updateTestingStatus(pinyin, target)
-            Log.i(tag, ">>> [${index + 1}/${testData.size}] 评测中: $pinyin -> $target")
-
-            runCandidateAreaEvaluation(result, target, pinyin)
-
-            results.add(result)
-            sendPartialReport(result)
-            Thread.sleep(600)
-        }
-
-        activityRule.activity.runOnUiThread {
-            activityRule.activity.setReportText("测试完成", Color.parseColor("#006400"))
-        }
-    }
-
-    private fun runCandidateAreaEvaluation(result: EvaluationResult, target: String, pinyin: String) {
-        try {
-            val et = findSafeEditText(2000) ?: run {
-                result.message = "ERROR: 输入框不存在"
-                return
-            }
-            clearTextViaDelete(et)
-
-            // 1) 模拟点击按键输入 pinyin
-            pinyin.forEach { char ->
-                pressKeyInternal(char)
-                Thread.sleep(90)
-            }
-
-            // 2) 输入完成后等待 1s，等待候选词出现
-            Thread.sleep(1000)
-
-            // 3) 只截取 candidate_area 区域
-            val candidateBitmap = captureCandidateAreaBitmap() ?: run {
-                result.message = "ERROR: candidate_area 未校准"
-                return
-            }
-
-            // 单行候选词严格按空白切分，不固定列数。
-            val ocrResult = runOcrSingleLineInOrder(candidateBitmap)
-            val tokens = ocrResult.tokens
-            result.attempts.addAll(tokens)
-
-            // 5) 对比 target：第1位=Top1，其它位=first line，否则not found
-            val hitIndex = tokens.indexOfFirst { matchCandidateWord(it, target) }
-            when {
-                hitIndex == 0 -> {
-                    result.wasFound = true
-                    result.selectedNo = 1
-                    result.selectedWord = target.trim()
-                    result.message = "Top1"
-                }
-                hitIndex > 0 -> {
-                    result.wasFound = true
-                    result.selectedNo = hitIndex + 1
-                    result.selectedWord = target.trim()
-                    result.message = "FIRST_LINE_MATCH"
-                }
-                else -> {
-                    result.wasFound = false
-                    result.selectedNo = 0
-                    result.message = "NOT_FOUND"
-                    saveFailedTestDebugInfo(pinyin, target, candidateBitmap, tokens, ocrResult.rawText)
-                }
-            }
-
-            clearTextViaDelete(findSafeEditText(500))
-        } catch (e: Exception) {
-            Log.e(tag, "评测流程异常", e)
-            result.message = "ERROR: ${e.message}"
-        }
-    }
-
-    private fun captureCandidateAreaBitmap(): Bitmap? {
-        val area = manualPositions["candidate_area"] ?: return null
-        val fullShotFile = File(instrumentation.targetContext.cacheDir, "panel_full.png")
-        if (fullShotFile.exists()) fullShotFile.delete()
-        uiDevice.takeScreenshot(fullShotFile)
-        val fullBitmap = BitmapFactory.decodeFile(fullShotFile.absolutePath) ?: return null
-
-        val left = area.left.coerceAtLeast(0)
-        val top = area.top.coerceAtLeast(0)
-        val right = area.right.coerceAtMost(fullBitmap.width)
-        val bottom = area.bottom.coerceAtMost(fullBitmap.height)
-        val w = (right - left).coerceAtLeast(1)
-        val h = (bottom - top).coerceAtLeast(1)
-        return Bitmap.createBitmap(fullBitmap, left, top, w, h)
-    }
-
-    /**
-     * 改进的单行OCR分割策略 - 纯图像列分割 + OCR
-     *
-     * 核心策略：
-     * 1. 第一步：纯图像处理 - 计算每列的暗像素密度，识别连续的墨迹块
-     * 2. 第二步：对每个块单独 OCR - 得到每个块的文本
-     * 
-     * 优势：
-     * - 只做一次 OCR（对每个块的 OCR）
-     * - 避免了整体 OCR 后启发式分割 token 的各种问题
-     * - 每个 OCR 块对应一个候选词，精准度高
-     */
-    private fun runOcrSingleLineInOrder(bitmap: Bitmap): OcrResult {
-        Log.d(tag, "===== runOcrSingleLineInOrder 开始 =====")
-        
-        // 第一步：纯图像分割 - 计算每列的墨迹密度，找出候选词的区域
-        Log.d(tag, "第一步：纯图像分割...")
-        val segmentRects = splitByVerticalWhitespaceAdaptive(bitmap)
-        Log.d(tag, "分割结果: ${segmentRects.size} 个矩形")
-        
-        // 第二步：对每个分割块进行 OCR
-        Log.d(tag, "第二步：对 ${segmentRects.size} 个块进行 OCR...")
-        val allTokens = mutableListOf<String>()
-        var rawText = ""  // 记录所有 OCR 结果用于调试
-        
-        if (segmentRects.isEmpty()) {
-            // 没有分割（图片太简单或只有一个候选词）
-            Log.d(tag, "没有分割矩形，对整个图片进行 OCR")
-            val enhancedBitmap = enhanceImageContrast(bitmap)
-            val latch = CountDownLatch(1)
-            
-            recognizer.process(InputImage.fromBitmap(enhancedBitmap, 0))
-                .addOnSuccessListener { visionText ->
-                    rawText = visionText.text.replace("\n", " ").trim()
-                    rawText = convertTraditionalToSimplified(rawText)
-                    Log.d(tag, "整体 OCR: '$rawText'")
-                    latch.countDown()
-                }
-                .addOnFailureListener {
-                    Log.w(tag, "整体 OCR 失败")
-                    latch.countDown()
-                }
-            latch.await(10, TimeUnit.SECONDS)
-            
-            // 按空白符分割
-            val tokens = rawText.split(Regex("\\s+"))
-                .filter { it.isNotEmpty() }
-                .map { normalizeOcrToken(it) }
-                .filter { it.isNotEmpty() }
-            allTokens.addAll(tokens)
-        } else {
-            // 有分割矩形，对每个块进行 OCR
-            segmentRects.forEachIndexed { idx, rect ->
-                val w = (rect.right - rect.left).coerceAtLeast(1)
-                val h = (rect.bottom - rect.top).coerceAtLeast(1)
-                
-                Log.d(tag, "  segment[$idx] rect: (${rect.left},${rect.top}) - (${rect.right},${rect.bottom}) size: ${w}x${h}")
-                
-                // 创建子图像
-                val part = Bitmap.createBitmap(bitmap, rect.left, rect.top, w, h)
-                
-                // 对这个块进行 OCR
-                val blockOcrText = runOcrRawText(part)
-                Log.d(tag, "    OCR 结果: '$blockOcrText'")
-                
-                if (blockOcrText.isNotEmpty()) {
-                    rawText += if (rawText.isEmpty()) blockOcrText else " $blockOcrText"
-                    
-                    // 按空白符分割该块的 OCR 结果（一个块可能包含多个词）
-                    val blockTokens = blockOcrText.split(Regex("\\s+"))
-                        .filter { it.isNotEmpty() }
-                        .map { normalizeOcrToken(it) }
-                        .filter { it.isNotEmpty() }
-                    
-                    if (blockTokens.isNotEmpty()) {
-                        allTokens.addAll(blockTokens)
-                        blockTokens.forEachIndexed { ti, token ->
-                            Log.d(tag, "      token[$ti] '$token'")
-                        }
-                    }
-                }
+            "14键测试", "14-key" -> when (calibKey) {
+                "q", "w" -> manualPositions["qw"] = rect
+                "e", "r" -> manualPositions["er"] = rect
+                "t", "y" -> manualPositions["ty"] = rect
+                "u", "i" -> manualPositions["ui"] = rect
+                "o", "p" -> manualPositions["op"] = rect
+                "a", "s" -> manualPositions["as"] = rect
+                "d", "f" -> manualPositions["df"] = rect
+                "g", "h" -> manualPositions["gh"] = rect
+                "j", "k" -> manualPositions["jk"] = rect
+                "z", "x" -> manualPositions["zx"] = rect
+                "c", "v" -> manualPositions["cv"] = rect
+                "b", "n" -> manualPositions["bn"] = rect
+                " " -> manualPositions["space"] = rect
             }
         }
-
-        Log.d(tag, "最终 tokens 数: ${allTokens.size}")
-        allTokens.forEachIndexed { i, token ->
-            Log.d(tag, "  [$i] '$token'")
-        }
-        Log.d(tag, "===== runOcrSingleLineInOrder 结束 =====")
-
-        return OcrResult(rawText = rawText, tokens = allTokens)
-    }
-
-
-    private fun runOcrRawText(bitmap: Bitmap): String {
-        val latch = CountDownLatch(1)
-        var raw = ""
-        
-        // 图像预处理：增强对比度以提高OCR识别精度
-        val enhancedBitmap = enhanceImageContrast(bitmap)
-        
-        recognizer.process(InputImage.fromBitmap(enhancedBitmap, 0))
-            .addOnSuccessListener {
-                raw = it.text
-                latch.countDown()
-            }
-            .addOnFailureListener {
-                latch.countDown()
-            }
-        latch.await(10, TimeUnit.SECONDS)
-        return raw
-    }
-
-    /**
-     * 图像对比度增强 - 改善 OCR 识别精度
-     * 通过直方图均衡化和亮度调整，增强文字与背景的对比度
-     */
-    private fun enhanceImageContrast(bitmap: Bitmap): Bitmap {
-        val width = bitmap.width
-        val height = bitmap.height
-        val pixels = IntArray(width * height)
-        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
-
-        // 计算直方图
-        val histogram = IntArray(256)
-        for (pixel in pixels) {
-            val lum = (Color.red(pixel) * 299 + Color.green(pixel) * 587 + Color.blue(pixel) * 114) / 1000
-            histogram[lum]++
-        }
-
-        // 计算累积直方图（用于均衡化）
-        val cumulative = IntArray(256)
-        cumulative[0] = histogram[0]
-        for (i in 1 until 256) {
-            cumulative[i] = cumulative[i - 1] + histogram[i]
-        }
-
-        // 计算映射表
-        val lut = IntArray(256)
-        val pixelCount = width * height
-        for (i in 0 until 256) {
-            // 规范化到 0-255 范围
-            lut[i] = ((cumulative[i].toLong() * 255) / pixelCount).toInt().coerceIn(0, 255)
-        }
-
-        // 应用直方图均衡化 + 额外的对比度提升
-        val enhancedPixels = IntArray(pixels.size)
-        for (i in pixels.indices) {
-            val pixel = pixels[i]
-            val r = Color.red(pixel)
-            val g = Color.green(pixel)
-            val b = Color.blue(pixel)
-            val alpha = Color.alpha(pixel)
-            
-            // 对每个通道应用映射
-            val newR = lut[r].coerceIn(0, 255)
-            val newG = lut[g].coerceIn(0, 255)
-            val newB = lut[b].coerceIn(0, 255)
-            
-            // 额外提升对比度（将接近中值的像素推向极端）
-            val contrast = 1.3f  // 对比度系数
-            val newR2 = ((newR - 128) * contrast + 128).toInt().coerceIn(0, 255)
-            val newG2 = ((newG - 128) * contrast + 128).toInt().coerceIn(0, 255)
-            val newB2 = ((newB - 128) * contrast + 128).toInt().coerceIn(0, 255)
-            
-            enhancedPixels[i] = Color.argb(alpha, newR2, newG2, newB2)
-        }
-
-        val enhanced = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        enhanced.setPixels(enhancedPixels, 0, width, 0, 0, width, height)
-        
-        Log.d(tag, "图像对比度增强: ${width}x${height}")
-        return enhanced
-    }
-
-    /**
-     * 改进的自适应图像列分割算法
-     *
-     * 三步处理：
-     * 1. 计算每列的暗像素数量（墨迹密度）
-     * 2. 识别连续的"墨迹块"（候选词的起止列）
-     * 3. 用自适应阈值判断块间间隙是否为词界
-     * 4. 逐块单独OCR
-     */
-    private fun splitByVerticalWhitespaceAdaptive(bitmap: Bitmap): List<Rect> {
-        val width = bitmap.width
-        val height = bitmap.height
-        if (width <= 2 || height <= 2) return emptyList()
-
-        // Step 1: 计算每列的暗像素数量
-        val darkCount = IntArray(width)
-        val darkThreshold = 235  // RGB > 235 为"亮像素"
-        for (x in 0 until width) {
-            var cnt = 0
-            for (y in 0 until height) {
-                val p = bitmap.getPixel(x, y)
-                val lum = (Color.red(p) * 299 + Color.green(p) * 587 + Color.blue(p) * 114) / 1000
-                if (lum < darkThreshold) cnt++
-            }
-            darkCount[x] = cnt
-        }
-
-        Log.d(tag, "Column darkness distribution: width=$width, height=$height")
-
-        // Step 2: 识别墨迹块（连续的暗列）
-        val inkThreshold = (height * 0.05f).toInt().coerceAtLeast(1)  // 至少5%的列高要有墨迹
-        Log.d(tag, "Ink threshold: $inkThreshold (height * 5%)")
-
-        val inkRuns = mutableListOf<IntRange>()
-        var start = -1
-        for (x in 0 until width) {
-            if (darkCount[x] >= inkThreshold) {
-                if (start < 0) start = x
-            } else if (start >= 0) {
-                inkRuns.add(start..(x - 1))
-                start = -1
-            }
-        }
-        if (start >= 0) inkRuns.add(start..(width - 1))
-
-        Log.d(tag, "Ink runs (continuous dark columns): ${inkRuns.size}")
-        inkRuns.forEachIndexed { idx, range ->
-            Log.d(tag, "  run[$idx]: cols ${range.first}-${range.last} (${range.last - range.first + 1} cols wide)")
-        }
-
-        if (inkRuns.size <= 1) {
-            Log.d(tag, "Only 1 or 0 ink run(s), cannot split further")
-            return emptyList()
-        }
-
-        // Step 3: 计算相邻块的间隙
-        val gaps = mutableListOf<Int>()
-        for (i in 0 until inkRuns.size - 1) {
-            val gap = inkRuns[i + 1].first - inkRuns[i].last - 1
-            gaps.add(gap.coerceAtLeast(0))
-        }
-
-        Log.d(tag, "Gaps between ink runs: $gaps (${gaps.size} gaps)")
-
-        // Step 4: 用统计方法自动判断词界阈值
-        val splitThreshold = calcAdaptiveSplitThreshold(gaps)
-        Log.d(tag, "Adaptive split threshold: $splitThreshold")
-
-        // Step 5: 按阈值分割
-        val wordRuns = mutableListOf<IntRange>()
-        var curRun = inkRuns[0]
-        for (i in 1 until inkRuns.size) {
-            val nextRun = inkRuns[i]
-            val gap = nextRun.first - curRun.last - 1
-            if (gap >= splitThreshold) {
-                // 这是一个词界
-                wordRuns.add(curRun)
-                curRun = nextRun
-                Log.d(tag, "  Split at gap=$gap >= $splitThreshold")
-            } else {
-                // 合并（同一个词的不同笔画）
-                curRun = curRun.first..nextRun.last
-                Log.d(tag, "  Merge at gap=$gap < $splitThreshold, now curRun=${curRun.first}-${curRun.last}")
-            }
-        }
-        wordRuns.add(curRun)
-
-        Log.d(tag, "Final word runs: ${wordRuns.size}")
-        wordRuns.forEachIndexed { idx, run ->
-            Log.d(tag, "  word[$idx]: cols ${run.first}-${run.last} (${run.last - run.first + 1} cols wide)")
-        }
-
-        // Step 6: 转换为 Rect，加边距
-        val minRunWidth = (width * 0.015f).toInt().coerceAtLeast(6)
-        val padX = 4
-        val padY = 2
-        return wordRuns
-            .filter { (it.last - it.first + 1) >= minRunWidth }
-            .map { run ->
-                val left = (run.first - padX).coerceAtLeast(0)
-                val right = (run.last + padX + 1).coerceAtMost(width)
-                val top = (0 - padY).coerceAtLeast(0)
-                val bottom = (height + padY).coerceAtMost(bitmap.height)
-                Rect(left, top, right, bottom)
-            }
-    }
-
-    /**
-     * 自适应阈值计算 - 用统计方法找出"词界"间隙
-     *
-     * 核心思想：
-     * - 同一个词的不同笔画间隙 → 小（通常 1-3 px）
-     * - 不同词之间的间隙 → 大（通常 8-20 px）
-     *
-     * 多层启发式策略：
-     * 1. 双峰聚类：寻找最大跳跃点
-     * 2. 均值偏离：用均值作为参考
-     * 3. 中位数分析：鲁棒性更好
-     * 4. 均匀分布检测：所有间隙都相等时采用激进拆分
-     * 5. 保守上限：确保不漏分
-     */
-    private fun calcAdaptiveSplitThreshold(gaps: List<Int>): Int {
-        if (gaps.isEmpty()) return Int.MAX_VALUE
-        if (gaps.size == 1) return (gaps[0] + 1).coerceAtLeast(8)
-
-        val sorted = gaps.sorted()
-        Log.d(tag, "Sorted gaps: $sorted")
-
-        // 方法1：寻找最大跳跃点（双峰检测）
-        var bestJump = Int.MIN_VALUE
-        var bestIdx = -1
-        for (i in 0 until sorted.size - 1) {
-            val jump = sorted[i + 1] - sorted[i]
-            Log.d(tag, "  Jump at idx $i: ${sorted[i]} → ${sorted[i + 1]} (jump=$jump)")
-            if (jump > bestJump) {
-                bestJump = jump
-                bestIdx = i
-            }
-        }
-
-        Log.d(tag, "Best jump: $bestJump at idx $bestIdx")
-
-        // 如果有明显的双峰（跳跃 >= 3px），用跳跃点中值
-        if (bestIdx >= 0 && bestJump >= 3) {
-            val threshold = (sorted[bestIdx] + sorted[bestIdx + 1]) / 2
-            Log.d(tag, "Strategy 1 (Dual-peak): threshold = (${sorted[bestIdx]} + ${sorted[bestIdx + 1]}) / 2 = $threshold")
-            return threshold.coerceAtLeast(4)
-        }
-
-        // 方法2：用均值 + 标准差分析
-        val mean = sorted.average()
-        val variance = sorted.map { (it - mean) * (it - mean) }.average()
-        val stdDev = sqrt(variance)
-        Log.d(tag, "Mean: $mean, StdDev: $stdDev")
-
-        if (stdDev > mean * 0.2f) {  // 标准差显著（> 20%均值）
-            val threshold = (mean + stdDev).toInt()
-            Log.d(tag, "Strategy 2 (Mean+StdDev): threshold = $mean + $stdDev = $threshold")
-            return threshold.coerceAtLeast(4)
-        }
-
-        // 方法3：用中位数 + 四分位数范围
-        val median = sorted[sorted.size / 2]
-        val q1Idx = sorted.size / 4
-        val q3Idx = (sorted.size * 3) / 4
-        val q1 = sorted[q1Idx.coerceAtMost(sorted.size - 1)]
-        val q3 = sorted[q3Idx.coerceAtMost(sorted.size - 1)]
-        val iqr = q3 - q1
-
-        Log.d(tag, "Median: $median, Q1: $q1, Q3: $q3, IQR: $iqr")
-
-        if (iqr > 1) {
-            // IQR大于1说明有较大的变异性
-            val threshold = (median + iqr).coerceAtLeast(q3)
-            Log.d(tag, "Strategy 3 (Median+IQR): threshold = max($median + $iqr, $q3) = $threshold")
-            return threshold.coerceAtLeast(4)
-        }
-
-        // 方法4：均匀分布检测 - 所有间隙都相等
-        if (stdDev <= 0.01f * mean) {  // 标准差接近0（间隙均匀分布）
-            // 假设候选词是均匀分布的，采用激进拆分
-            // 用间隙的最小值 - 1 作为阈值（这样所有间隙都会被拆开）
-            val threshold = sorted.first().coerceAtLeast(1)
-            Log.d(tag, "Strategy 4 (Uniform): All gaps are equal, using aggressive split, threshold = ${threshold - 1}")
-            return (threshold - 1).coerceAtLeast(1)
-        }
-
-        // 方法5：保守兜底，用最大间隙 + 1
-        val threshold = sorted.last() + 1
-        Log.d(tag, "Strategy 5 (Conservative): threshold = ${sorted.last()} + 1 = $threshold")
-        return threshold.coerceAtLeast(4)
-    }
-
-    private fun normalizeOcrToken(raw: String): String {
-        // 保留所有有效字符（中文、英文、数字）
-        // 只移除：换行、制表符、空白、特殊符号、表情符等
-        val cleaned = raw
-            .replace(Regex("[\\r\\n\\t]+"), "")  // 移除换行和制表符
-            .replace(Regex("[^\\p{L}\\p{N}\\u4E00-\\u9FFF]"), "")  // 只保留字母、数字、汉字（CJK范围）
-            .trim()
-        
-        if (cleaned.isEmpty()) {
-            Log.d(tag, "normalizeOcrToken: '$raw' → (empty after normalization)")
-            return ""
-        }
-        
-        // 检测并纠正 OCR 误识别的字符
-        val corrected = correctOcrErrors(cleaned)
-        if (corrected != cleaned) {
-            Log.w(tag, "OCR错误纠正: '$cleaned' → '$corrected'")
-        }
-        
-        val simplified = convertTraditionalToSimplified(corrected)
-        
-        // 增强的调试日志 - 追踪每一步的转换
-        Log.d(tag, "normalizeOcrToken详细: raw='$raw'")
-        Log.d(tag, "  step1_clean: '$cleaned'")
-        Log.d(tag, "  step2_correct: '$corrected'")
-        Log.d(tag, "  step3_simplified: '$simplified'")
-        
-        // 检查是否有意外的字符变化
-        if (simplified.contains("律") && !raw.contains("律")) {
-            Log.e(tag, "⚠️ 警告: 检测到异常字符生成! raw='$raw' 不含律，但simplified='$simplified'含律")
-        }
-        
-        return simplified
-    }
-
-    /**
-     * OCR 误识别检测和纠正
-     * 对于多字词汇，逐字符检查是否存在常见的OCR误识别，并进行纠正
-     */
-    private fun correctOcrErrors(text: String): String {
-        var result = text
-        
-        // 逐个字符检查并纠正
-        for (i in text.indices) {
-            val char = text[i].toString()
-            if (ocrErrorCorrections.containsKey(char)) {
-                val candidates = ocrErrorCorrections[char] ?: continue
-                
-                // 对于在候选词列表中的候选项，使用第一个候选项作为纠正值
-                // 在实际应用中，可以结合上下文和目标词来更智能地选择
-                val correction = candidates.firstOrNull { it.length == 1 }
-                if (correction != null) {
-                    result = result.replaceFirst(char, correction)
-                    Log.w(tag, "Corrected OCR error at position $i: '$char' → '$correction'")
-                }
-            }
-        }
-        
-        return result
-    }
-
-    /**
-     * 繁简体转换 - 使用 OpenCC4j 库处理 OCR 候选词
-     * 将 OCR 输出的任何繁体字转换为简体
-     * 这样确保 candidates 都是简体，便于与 target 匹配
-     */
-    private fun convertTraditionalToSimplified(text: String): String {
-        return try {
-            // 使用 OpenCC4j 的正确 API：toSimple()
-            val simplified = ZhConverterUtil.toSimple(text)
-
-            // 检测转换是否产生了非中文字符（防止"才"→"オ"这类问题）
-            if (simplified != text) {
-                // 检查是否产生了非中文的异常字符
-                val hasForeignChars = simplified.any { char ->
-                    val code = char.code
-                    // 中文范围: CJK Unified Ideographs (4E00-9FFF) + CJK Ext A/B (3400-4DBF, 20000-2A6DF)
-                    // 数字: 0-9
-                    // 英文: a-z, A-Z
-                    !(code in 0x4E00..0x9FFF ||  // 主要中文字符范围
-                      code in 0x3400..0x4DBF ||  // CJK扩展 A
-                      code in 0x20000..0x2A6DF || // CJK扩展 B
-                      (code >= '0'.code && code <= '9'.code) ||  // 数字
-                      (code >= 'a'.code && code <= 'z'.code) ||  // 小写英文
-                      (code >= 'A'.code && code <= 'Z'.code))    // 大写英文
-                }
-
-                if (hasForeignChars) {
-                    Log.e(tag, "⚠️ 警告: OpenCC 转换产生了非中文字符! input='$text' output='$simplified'")
-                    Log.d(tag, "  转换被拒绝，返回原文本")
-                    return text
-                }
-                
-                // 新增：检查转换是否改变了太多字符（防止"社"→"杜"这类错误）
-                // 计算有多少个字符被改变了
-                var changedCount = 0
-                for (i in text.indices) {
-                    if (i < simplified.length && text[i] != simplified[i]) {
-                        changedCount++
-                    }
-                }
-                
-                // 如果改变的字符数占比太高（>50%），说明转换可能有问题
-                if (text.length > 0 && changedCount > text.length / 2) {
-                    Log.e(tag, "⚠️ 警告: OpenCC 转换改变过多字符! " +
-                        "input='$text' output='$simplified' changed=$changedCount/${text.length}")
-                    return text
-                }
-
-                Log.d(tag, "OpenCC 转换: '$text' → '$simplified'")
-            }
-            simplified
-        } catch (e: Exception) {
-            Log.w(tag, "OpenCC 转换失败: ${e.message}，返回原文本")
-            text
-        }
-    }
-
-    /**
-     * 简体中文候选词精确匹配函数
-     * 只支持精确匹配，不允许模糊匹配
-     * 原因：模糊匹配（编辑距离）会导致错误的 SUCCESS
-     * 例如："发泄" 不应该匹配 "发型"（相差1字符）
-     */
-    private fun matchCandidateWord(candidate: String, target: String): Boolean {
-        val candTrimmed = candidate.trim()
-        val targetTrimmed = target.trim()
-
-        // 只支持精确匹配
-        val isExactMatch = candTrimmed == targetTrimmed
-        
-        if (isExactMatch) {
-            Log.d(tag, "Match [EXACT]: '$candTrimmed' == '$targetTrimmed'")
-        } else {
-            Log.d(tag, "NoMatch: '$candTrimmed' != '$targetTrimmed'")
-        }
-        
-        return isExactMatch
-    }
-
-    private fun formatResult(res: EvaluationResult): String {
-        val status = if (res.wasFound) "SUCCESS" else "NOT_FOUND"
-        val candidates = if (res.attempts.isEmpty()) "无" else res.attempts.take(8).joinToString(" | ")
-        return String.format("%s | %s -> %s | Pos: %d | %s\n候选词: [%s]", status, res.pinyinSequence, res.targetWord, res.selectedNo, res.message, candidates)
-    }
-
-    private fun updateTestingStatus(pinyin: String, target: String) {
-        val prev = results.lastOrNull()
-        val prevText = prev?.let { "【前次结果】\n${formatResult(it)}" } ?: "【前次结果】\n等待中..."
-        val currText = "【正在测试】\n$pinyin -> $target ..."
-        activityRule.activity.runOnUiThread { activityRule.activity.setReportText("$prevText\n\n$currText", Color.DKGRAY) }
     }
 
     private fun sendPartialReport(result: EvaluationResult) {
         val prev = results.getOrNull(results.size - 2)
-        val prevText = prev?.let { "【前次结果】\n${formatResult(it)}" } ?: ""
-        val currText = "【当前结果】\n${formatResult(result)}"
-        Log.i(tag, "[ITEM RESULT] ${result.pinyinSequence} -> ${result.targetWord} | ${if(result.wasFound) "SUCCESS" else "NOT_FOUND"}")
+        val prevText = prev?.let { "[Prev]\n${formatResult(it)}" } ?: ""
+        val currText = "[Current]\n${formatResult(result)}"
         activityRule.activity.runOnUiThread {
             val color = if (result.wasFound) Color.parseColor("#006400") else Color.RED
             activityRule.activity.setReportText(if (prevText.isNotEmpty()) "$prevText\n\n$currText" else currText, color)
         }
     }
 
-    @After
-    fun generateReport() {
-        if (results.isEmpty()) return
-        val finalReport = buildFinalReport()
-        val reportFile = testDataManager.saveReport(finalReport)
-
-        // 在最终报告中添加调试目录信息
-        if (debugDir.exists() && debugDir.listFiles()?.isNotEmpty() == true) {
-            val debugSummary = StringBuilder("\n\n========== 失败测试调试信息 ==========\n")
-            debugSummary.append("调试文件目录: ${debugDir.absolutePath}\n")
-            debugSummary.append("失败测试数: ${results.count { !it.wasFound }}\n")
-            val failedFiles = debugDir.listFiles()?.sortedBy { it.name } ?: emptyList()
-            debugSummary.append("调试文件总数: ${failedFiles.size}\n\n")
-            failedFiles.forEach { file ->
-                debugSummary.append("  - ${file.name}\n")
-            }
-            debugSummary.append("=====================================\n")
-            Log.i(tag, debugSummary.toString())
-        }
-
-        if (reportFile != null && reportFile.exists()) {
-            try {
-                uiDevice.executeShellCommand("am start -a android.intent.action.VIEW -d \"file://${reportFile.absolutePath}\" -t \"text/plain\"")
-            } catch (e: Exception) { Log.e(tag, "无法自动打开报告文件", e) }
-        }
-
-        activityRule.activity.runOnUiThread {
-            activityRule.activity.setReportText("测试完成\n报告: ${reportFile?.absolutePath ?: "保存失败"}", Color.parseColor("#006400"))
-        }
-        Thread.sleep(3000)
+    private fun formatResult(res: EvaluationResult): String {
+        val status = if (res.wasFound) "SUCCESS" else "NOT_FOUND"
+        val candidates = if (res.attempts.isEmpty()) "none" else res.attempts.take(8).joinToString(" | ")
+        return String.format("%s | %s -> %s | Pos: %d | %s\nCandidates: [%s]", status, res.pinyinSequence, res.targetWord, res.selectedNo, res.message, candidates)
     }
 
     private fun buildFinalReport(): String {
@@ -867,9 +1142,10 @@ class KeyboardEvaluationTest {
         val top1Count = results.count { it.wasFound && it.selectedNo == 1 }
         val firstLineCount = results.count { it.wasFound && it.selectedNo > 1 }
         val notFoundCount = results.count { !it.wasFound }
-        val overallRate = (results.count { it.wasFound }.toDouble() / totalCount) * 100
+        val overallRate = if (totalCount > 0) (results.count { it.wasFound }.toDouble() / totalCount) * 100 else 0.0
         val imeId = Settings.Secure.getString(instrumentation.targetContext.contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
         val imeName = imeId?.split('/')?.get(0) ?: "Unknown"
+
         val sb = StringBuilder("=========== FINAL EVALUATION REPORT ============\n")
         sb.append("IME: $imeName | Mode: $keyboardMode\n")
         sb.append("--------------------------------------------------------------------------------\n")
@@ -879,41 +1155,11 @@ class KeyboardEvaluationTest {
         }
         sb.append("--------------------------------------------------------------------------------\n")
         sb.append(String.format("  Success Rate:      %.2f%% (%d/%d)\n", overallRate, results.count { it.wasFound }, totalCount))
-        sb.append(String.format("  Top 1 Rate:        %.2f%%\n", (top1Count.toDouble() / totalCount) * 100))
-        sb.append(String.format("  first line Rate:   %.2f%%\n", (firstLineCount.toDouble() / totalCount) * 100))
-        sb.append(String.format("  Not Found Rate:    %.2f%% (%d/%d)\n", (notFoundCount.toDouble() / totalCount) * 100, notFoundCount, totalCount))
+        sb.append(String.format("  Top 1 Rate:        %.2f%%\n", if (totalCount > 0) (top1Count.toDouble() / totalCount) * 100 else 0.0))
+        sb.append(String.format("  first line Rate:   %.2f%%\n", if (totalCount > 0) (firstLineCount.toDouble() / totalCount) * 100 else 0.0))
+        sb.append(String.format("  Not Found Rate:    %.2f%% (%d/%d)\n", if (totalCount > 0) (notFoundCount.toDouble() / totalCount) * 100 else 0.0, notFoundCount, totalCount))
         sb.append("================ END OF REPORT ================\n")
         return sb.toString()
-    }
-
-    private fun pressKeyInternal(key: Char) {
-        val keyChar = key.lowercaseChar()
-        val targetKeyStr = when (keyboardMode) {
-            "9键测试" -> {
-                when (keyChar) {
-                    'a', 'b', 'c' -> "2"; 'd', 'e', 'f' -> "3"; 'g', 'h', 'i' -> "4"
-                    'j', 'k', 'l' -> "5"; 'm', 'n', 'o' -> "6"; 'p', 'q', 'r', 's' -> "7"
-                    't', 'u', 'v' -> "8"; 'w', 'x', 'y', 'z' -> "9"; ' ' -> "0"
-                    else -> keyChar.toString()
-                }
-            }
-            "14键测试" -> {
-                when (keyChar) {
-                    'q', 'w' -> "qw"; 'e', 'r' -> "er"; 't', 'y' -> "ty"; 'u', 'i' -> "ui"; 'o', 'p' -> "op"
-                    'a', 's' -> "as"; 'd', 'f' -> "df"; 'g', 'h' -> "gh"; 'j', 'k' -> "jk"
-                    'z', 'x' -> "zx"; 'c', 'v' -> "cv"; 'b', 'n' -> "bn"
-                    ' ' -> "space"
-                    else -> keyChar.toString()
-                }
-            }
-            else -> { // 26键测试
-                if (keyChar == ' ') "space" else keyChar.toString()
-            }
-        }
-        manualPositions[targetKeyStr]?.let {
-            uiDevice.click(it.centerX(), it.centerY())
-            Thread.sleep(50)
-        } ?: Log.e(tag, "未找到按键 '$targetKeyStr' 的校准坐标点！")
     }
 
     private fun saveFailedTestDebugInfo(
@@ -925,61 +1171,132 @@ class KeyboardEvaluationTest {
     ) {
         try {
             val timestamp = System.currentTimeMillis()
-            val safeFileName = pinyin.replace(Regex("[^a-zA-Z0-9]"), "_")
+            val safeName = pinyin.replace(Regex("[^a-zA-Z0-9]"), "_")
+            val dateStr = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(timestamp))
 
-            // 保存截图
-            val screenshotFile = File(debugDir, "failed_${safeFileName}_${timestamp}.png")
-            screenshotFile.outputStream().use { out ->
-                screenshot.compress(Bitmap.CompressFormat.PNG, 100, out)
-            }
+            // 保存到 OUTPUT_DIR/failed_tests/ 子目录
+            val failedDir = File(debugDir, "failed_tests").apply { mkdirs() }
+            val screenshotFile = File(failedDir, "failed_${safeName}_${timestamp}_screenshot.png")
+            saveBitmapPng(screenshot, screenshotFile)
+            Log.i(tag, "  ✓ Screenshot: ${screenshotFile.name}")
 
-            // 保存OCR识别结果
-            val ocrFile = File(debugDir, "failed_${safeFileName}_${timestamp}_ocr.txt")
+            val ocrFile = File(failedDir, "failed_${safeName}_${timestamp}_ocr_report.txt")
             val ocrReport = StringBuilder()
-            ocrReport.append("拼音: $pinyin\n")
-            ocrReport.append("目标词: $target\n")
-            ocrReport.append("时间: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(timestamp))}\n")
-            ocrReport.append("键盘模式: $keyboardMode\n")
-
-            ocrReport.append("\n========== OCR原始文本 ==========" + "\n")
-            ocrReport.append(if (rawOcrText.isBlank()) "<empty>\n" else "$rawOcrText\n")
-
-            ocrReport.append("\n========== OCR原始文本字符解析（含码点）==========" + "\n")
+            ocrReport.append("╔════════════════════════════════════════════════════════════╗\n")
+            ocrReport.append("║          NOT_FOUND 失败测试调试信息                        ║\n")
+            ocrReport.append("╚════════════════════════════════════════════════════════════╝\n\n")
+            ocrReport.append("【基本信息】\n")
+            ocrReport.append("  拼音 (pinyin):   $pinyin\n")
+            ocrReport.append("  目标词 (target): $target\n")
+            ocrReport.append("  时间 (time):     $dateStr\n")
+            ocrReport.append("  键盘模式 (mode): $keyboardMode\n")
+            ocrReport.append("  截图大小:        ${screenshot.width}x${screenshot.height} pixels\n\n")
+            
+            ocrReport.append("【OCR原始结果】\n")
             if (rawOcrText.isBlank()) {
-                ocrReport.append("<empty>\n")
+                ocrReport.append("  ⚠️  OCR返回空字符串！\n")
             } else {
-                rawOcrText.forEachIndexed { idx, ch ->
-                    val code = ch.code
-                    val desc = when {
-                        ch == ' ' -> "[SPACE U+0020]"
-                        ch.isWhitespace() -> "[${ch.category} U+${code.toString(16).uppercase().padStart(4, '0')}]"
-                        else -> "[$ch]"
-                    }
-                    ocrReport.append("$idx: $desc\n")
-                }
+                ocrReport.append("  原始文本: '$rawOcrText'\n")
+                ocrReport.append("  长度: ${rawOcrText.length}\n")
             }
-
-            ocrReport.append("\n========== 按 \\s+ 切分后的OCR结果 (${tokens.size}个) ==========" + "\n")
+            ocrReport.append("\n")
+            
+            ocrReport.append("【分割后的候选词】\n")
+            ocrReport.append("  总数: ${tokens.size}\n")
             if (tokens.isEmpty()) {
-                ocrReport.append("<分割失败，0个token>\n")
+                ocrReport.append("  ⚠️  没有识别到任何候选词！\n\n")
+                ocrReport.append("【问题分析】\n")
+                ocrReport.append("  • OCR分割失败 - 没有识别到任何词\n")
+                ocrReport.append("  • 可能原因：\n")
+                ocrReport.append("    1. 图像质量太低或对比度不足\n")
+                ocrReport.append("    2. OCR模型加载失败\n")
+                ocrReport.append("    3. 文字位置超出裁剪区域\n")
             } else {
+                ocrReport.append("  候选词列表：\n")
                 tokens.forEachIndexed { idx, token ->
-                    val mark = if (token == target) " ← [目标词]" else ""
-                    ocrReport.append("${idx + 1}. $token$mark\n")
+                    val isMatch = token == target
+                    val mark = if (isMatch) " ← ✓ 匹配目标词" else ""
+                    ocrReport.append("    ${"%-2d".format(idx + 1)}. '$token'$mark\n")
+                }
+                ocrReport.append("\n【问题分析】\n")
+                val foundTarget = tokens.any { it == target }
+                if (foundTarget) {
+                    ocrReport.append("  ⚠️  意外：目标词已找到，但判定为NOT_FOUND\n")
+                } else {
+                    ocrReport.append("  • 目标词未在候选词中找到\n")
+                    ocrReport.append("  • 候选词与目标词的匹配情况：\n")
+                    tokens.forEach { candidate ->
+                        val similarity = calculateSimilarity(candidate, target)
+                        val dist = levenshteinDistance(candidate, target)
+                        ocrReport.append("    '$candidate' vs '$target': 相似度=${"%.1f".format(similarity*100)}% 编辑距离=$dist\n")
+                    }
                 }
             }
+            
+            ocrReport.append("\n【推荐检查项】\n")
+            ocrReport.append("  1. 查看 screenshot.png 中的实际图像内容\n")
+            ocrReport.append("  2. 检查截图的大小是否正确\n")
+            ocrReport.append("  3. 检查键盘校准坐标是否准确\n")
+            ocrReport.append("  4. 检查 ocr_blocks/ 目录下分割后的各块\n")
+            
+            writeTextFile(ocrFile, ocrReport.toString())
+            Log.i(tag, "  ✓ OCR Report: ${ocrFile.name}")
 
-            ocrReport.append("\n========== 调试日志（从 logcat 中提取相关日志） ==========" + "\n")
-            ocrReport.append("见设备 logcat: KeyboardEvaluator 标签\n")
+            // 保存 ocr_blocks（仅失败时保存）
+            val blocksDir = File(failedDir, "ocr_blocks_${safeName}").apply { mkdirs() }
+            saveBitmapPng(screenshot, File(blocksDir, "00_full.png"))
+            val rects = splitByVerticalWhitespaceAdaptive(screenshot)
+            rects.forEachIndexed { i, rect ->
+                try {
+                    val w = (rect.right - rect.left).coerceAtLeast(1)
+                    val h = (rect.bottom - rect.top).coerceAtLeast(1)
+                    val block = Bitmap.createBitmap(screenshot, rect.left, rect.top, w, h)
+                    saveBitmapPng(block, File(blocksDir, "block_${i}.png"))
+                    block.recycle()
+                } catch (e: Exception) { /* ignore */ }
+            }
+            Log.i(tag, "  ✓ OCR blocks (${rects.size}): ${blocksDir.name}/")
 
-            ocrFile.writeText(ocrReport.toString())
-
-            Log.i(tag, "已保存失败测试调试信息:")
-            Log.i(tag, "  截图: ${screenshotFile.absolutePath}")
-            Log.i(tag, "  OCR: ${ocrFile.absolutePath}")
+            Log.i(tag, "📊 NOT_FOUND 已保存 → ${failedDir.absolutePath}")
+            
         } catch (e: Exception) {
-            Log.e(tag, "保存失败测试调试信息时出错", e)
+            Log.e(tag, "Save debug info failed", e)
         }
+    }
+    
+    /**
+     * 计算两个字符串的相似度 (0.0 - 1.0)
+     */
+    private fun calculateSimilarity(s1: String, s2: String): Double {
+        if (s1 == s2) return 1.0
+        if (s1.isEmpty() || s2.isEmpty()) return 0.0
+        
+        val maxLen = maxOf(s1.length, s2.length)
+        val dist = levenshteinDistance(s1, s2)
+        return 1.0 - (dist.toDouble() / maxLen)
+    }
+    
+    /**
+     * 计算编辑距离（Levenshtein Distance）
+     */
+    private fun levenshteinDistance(s1: String, s2: String): Int {
+        val dp = Array(s1.length + 1) { IntArray(s2.length + 1) }
+        
+        for (i in 0..s1.length) dp[i][0] = i
+        for (j in 0..s2.length) dp[0][j] = j
+        
+        for (i in 1..s1.length) {
+            for (j in 1..s2.length) {
+                val cost = if (s1[i - 1] == s2[j - 1]) 0 else 1
+                dp[i][j] = minOf(
+                    dp[i - 1][j] + 1,     // 删除
+                    dp[i][j - 1] + 1,     // 插入
+                    dp[i - 1][j - 1] + cost  // 替换
+                )
+            }
+        }
+        
+        return dp[s1.length][s2.length]
     }
 
     data class OcrResult(
@@ -987,6 +1304,121 @@ class KeyboardEvaluationTest {
         val tokens: List<String>
     )
 
+    /**
+     * OCR 诊断测试：测试 OCR 引擎是否能识别基本文字
+     * 这个测试不依赖于真实的键盘输入，而是直接测试 OCR 引擎的能力
+     */
+    @Test
+    fun testOcrEngineDiagnostic() {
+        Log.i(tag, "=".repeat(80))
+        Log.i(tag, "OCR 引擎诊断测试")
+        Log.i(tag, "=".repeat(80))
+        
+        try {
+            // 生成一个简单的测试图片（白底黑字）
+            val testText = "你好世界"
+            Log.i(tag, "生成测试图片，文字: [$testText]")
+            
+            // 使用更大的尺寸和对比度生成测试图像
+            val testBitmap = generateSimpleTextBitmap(testText, 600, 200)
+            
+            // 保存测试图片到 OUTPUT_DIR
+            val diagDir = debugDir
+            val testFile = File(diagDir, "test_simple_${SimpleDateFormat("HHmmss_SSS", Locale.US).format(Date())}.png")
+            saveBitmapPng(testBitmap, testFile)
+            Log.i(tag, "✓ 测试图片已保存: ${testFile.name}")
+            Log.i(tag, "  • 图像尺寸: ${testBitmap.width}x${testBitmap.height}")
+            Log.i(tag, "  • 文字内容: $testText")
+            
+            // 执行 OCR
+            Log.i(tag, "执行 OCR 识别...")
+            val result = runBlocking { ocrHelper.recognizeText(testBitmap) }
+            
+            // 记录结果
+            Log.i(tag, "=".repeat(80))
+            Log.i(tag, "OCR 识别结果:")
+            Log.i(tag, "  Success: ${result.success}")
+            Log.i(tag, "  识别文本: '${result.text}'")
+            Log.i(tag, "  Tokens: ${result.tokens}")
+            Log.i(tag, "  Details 数量: ${result.details.size}")
+            result.details.forEach { detail ->
+                Log.i(tag, "    - 文本='${detail.text}' 置信度=${String.format("%.2f%%", detail.confidence * 100)}")
+            }
+            if (result.error != null) {
+                Log.e(tag, "  Error: ${result.error}")
+            }
+            Log.i(tag, "=".repeat(80))
+            
+            // 判断是否成功
+            val recognized = result.text.isNotEmpty()
+            if (recognized) {
+                Log.i(tag, "✅ OCR 引擎能够识别文字！识别结果: '${result.text}'")
+            } else {
+                Log.e(tag, "❌ OCR 引擎无法识别文字，返回空字符串")
+                Log.e(tag, "   这表明 OCR 引擎本身可能有问题，或者模型加载失败")
+                Log.e(tag, "   请参考OcrHelper中的诊断日志了解详情")
+            }
+            
+            testBitmap.recycle()
+            
+        } catch (e: Exception) {
+            Log.e(tag, "OCR 诊断测试异常: ${e.message}", e)
+            throw e
+        }
+    }
+    
+    /**
+     * 生成简单的带文字位图（用于诊断测试）
+     * 改进：更清晰的文字渲染，更高的对比度
+     */
+    private fun generateSimpleTextBitmap(text: String, width: Int, height: Int): Bitmap {
+        // 验证参数
+        if (width <= 0 || height <= 0) {
+            Log.w(tag, "位图尺寸无效，使用默认值: width=$width, height=$height")
+        }
+        val validWidth = if (width > 0) width else 400
+        val validHeight = if (height > 0) height else 150
+        
+        Log.d(tag, "生成位图: ${validWidth}x${validHeight}, 文字='$text'")
+        
+        // 使用ARGB_8888以获得最好的效果
+        val bitmap = Bitmap.createBitmap(validWidth, validHeight, Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(bitmap)
+        
+        // 填充白色背景（最高对比度）
+        canvas.drawColor(Color.WHITE)
+        
+        // 绘制文字 - 使用粗体获得更清晰的效果
+        val paint = android.graphics.Paint().apply {
+            color = Color.BLACK        // 完全黑色获得最高对比度
+            textSize = (validHeight * 0.65f).coerceAtMost(80f)  // 字体大小不超过80
+            isAntiAlias = true
+            typeface = android.graphics.Typeface.create(
+                android.graphics.Typeface.SANS_SERIF, 
+                android.graphics.Typeface.BOLD  // 使用粗体
+            )
+            textAlign = android.graphics.Paint.Align.CENTER
+            strokeWidth = 0f
+        }
+        
+        // 计算文字位置以确保完全在画布内
+        val textBounds = Rect()
+        paint.getTextBounds(text, 0, text.length, textBounds)
+        
+        val x = validWidth / 2f
+        val y = (validHeight - textBounds.top - textBounds.bottom) / 2f
+        
+        Log.d(tag, "文字绘制:")
+        Log.d(tag, "  • 位置: (${x}, ${y})")
+        Log.d(tag, "  • 字体大小: ${paint.textSize}")
+        Log.d(tag, "  • 边界: ${textBounds}")
+        
+        canvas.drawText(text, x, y, paint)
+        
+        Log.d(tag, "位图生成完成，大小=${bitmap.width}x${bitmap.height}")
+        
+        return bitmap
+    }
 
     data class EvaluationResult(
         val pinyinSequence: String,
@@ -998,3 +1430,4 @@ class KeyboardEvaluationTest {
         var message: String = ""
     )
 }
+

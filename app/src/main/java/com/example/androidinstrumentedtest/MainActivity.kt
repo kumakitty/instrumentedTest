@@ -26,10 +26,6 @@ import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.TextRecognizer
-import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -47,9 +43,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var importDataButton: Button
     private lateinit var calibrateButton: Button
     private lateinit var startTestButton: Button
+    private lateinit var selectOutputDirButton: Button
     private lateinit var keyboardTypeSpinner: Spinner
     private lateinit var calibrationFileSpinner: Spinner
     private lateinit var currentTestDataText: TextView
+    private lateinit var outputDirText: TextView
     private lateinit var evaluationEditText: EditText
     
     private lateinit var prefs: SharedPreferences
@@ -99,14 +97,16 @@ class MainActivity : AppCompatActivity() {
     private var projectionManager: MediaProjectionManager? = null
     private var mediaProjection: MediaProjection? = null
     
-    private val recognizer: TextRecognizer by lazy {
-        TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
-    }
+    // 注: TextRecognizer 已移除，改用 PaddleOCR 本地引擎（见 OcrHelper.kt）
+    // private val recognizer: TextRecognizer by lazy {
+    //     TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
+    // }
 
     companion object {
         const val EXTRA_IS_TEST_MODE = "is_test_mode"
         private const val PICK_DATA_REQUEST_CODE = 1001
         private const val SCREEN_CAPTURE_REQUEST_CODE = 1002
+        private const val OPEN_DIRECTORY_REQUEST_CODE = 1003
         private const val TAG = "Calibration"
     }
 
@@ -125,9 +125,11 @@ class MainActivity : AppCompatActivity() {
         importDataButton = findViewById(R.id.import_data_button)
         calibrateButton = findViewById(R.id.calibrate_button)
         startTestButton = findViewById(R.id.start_test_button)
+        selectOutputDirButton = findViewById(R.id.select_output_dir_button)
         keyboardTypeSpinner = findViewById(R.id.keyboard_type_spinner)
         calibrationFileSpinner = findViewById(R.id.calibration_file_spinner)
         currentTestDataText = findViewById(R.id.current_test_data_text)
+        outputDirText = findViewById(R.id.output_dir_text)
         evaluationEditText = findViewById(R.id.evaluation_edit_text)
 
         projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -137,12 +139,14 @@ class MainActivity : AppCompatActivity() {
         setupKeyboardSpinner()
         refreshCalibrationList()
         refreshFileInfo()
+        refreshOutputDirectoryInfo()
 
         if (intent.getBooleanExtra(EXTRA_IS_TEST_MODE, false)) {
             findViewById<View>(R.id.start_test_button).visibility = View.GONE
         } else {
             importDataButton.setOnClickListener { openFilePicker(PICK_DATA_REQUEST_CODE) }
             calibrateButton.setOnClickListener { requestScreenCapturePermission() }
+            selectOutputDirButton.setOnClickListener { requestDirectoryPermission() }
             startTestButton.setOnClickListener { runInstrumentationTest() }
         }
     }
@@ -193,7 +197,7 @@ class MainActivity : AppCompatActivity() {
         val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, fileNames)
         calibrationFileSpinner.adapter = adapter
         
-        val lastCal = prefs.getString(KEY_CALIBRATION_FILE, "")
+        val lastCal = prefs.getString(KEY_CALIBRATION_FILE, "") ?: ""
         val pos = fileNames.indexOf(lastCal)
         if (pos != -1) calibrationFileSpinner.setSelection(pos) else autoSelectMatchingCalibration()
 
@@ -234,6 +238,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun refreshOutputDirectoryInfo() {
+        outputDirText.text = OutputDirectoryManager.buildStatusText(this)
+    }
+
+    private fun requestDirectoryPermission() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            addFlags(Intent.FLAG_GRANT_PREFIX_URI_PERMISSION)
+        }
+        startActivityForResult(intent, OPEN_DIRECTORY_REQUEST_CODE)
+    }
+
     private fun getCurrentImeName(): String {
         val imeId = Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
         return imeId?.split('/')?.get(0)?.split('.')?.last() ?: "UnknownIME"
@@ -257,22 +275,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun getAllOcrTokens(screenshot: Bitmap, onResult: (List<String>) -> Unit) {
+        // 注: OCR 功能已移至测试代码（OcrHelper.kt）
+        // 校准工具不需要 OCR，直接返回空列表
         try {
-            val areaJson = calibrationPointsJson.optJSONObject("candidate_area")
-            val imageToProcess = if (areaJson != null) {
-                val cx = areaJson.getInt("x"); val cy = areaJson.getInt("y")
-                val w = areaJson.getInt("w"); val h = areaJson.getInt("h")
-                val left = Math.max(0, cx - w / 2); val top = Math.max(0, cy - h / 2)
-                val cropW = Math.min(w, screenshot.width - left); val cropH = Math.min(h, screenshot.height - top)
-                Bitmap.createBitmap(screenshot, left, top, cropW, cropH)
-            } else { screenshot }
-            recognizer.process(InputImage.fromBitmap(imageToProcess, 0)).addOnSuccessListener { visionText ->
-                val allTokens = mutableListOf<String>()
-                visionText.textBlocks.sortedWith(compareBy({ it.boundingBox?.top ?: 0 }, { it.boundingBox?.left ?: 0 })).forEach { block ->
-                    allTokens.addAll(block.text.split(Regex("[\\s\\n]+")).filter { it.isNotBlank() })
-                }
-                onResult(allTokens)
-            }.addOnFailureListener { onResult(emptyList()) }
+            // 原 ML Kit 代码已注释
+            // recognizer.process(InputImage.fromBitmap(imageToProcess, 0))...
+            onResult(emptyList())  // 返回空列表
         } catch (e: Exception) { onResult(emptyList()) }
     }
 
@@ -304,6 +312,19 @@ class MainActivity : AppCompatActivity() {
                     val realName = getFileNameFromUri(uri); File(File(filesDir, "InstrumentedTest"), "last_test_data_name.txt").writeText(realName)
                     copyFileToInternal(uri, "test_data.txt", "[测试数据]") 
                 }
+            }
+            OPEN_DIRECTORY_REQUEST_CODE -> {
+                val treeUri = data.data ?: return
+                val incomingFlags = data.flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                val takeFlags = if (incomingFlags != 0) {
+                    incomingFlags
+                } else {
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                }
+                contentResolver.takePersistableUriPermission(treeUri, takeFlags)
+                OutputDirectoryManager.saveAuthorizedTreeUri(this, treeUri)
+                refreshOutputDirectoryInfo()
+                setReportText("✅ 已授权测试输出目录: ${OutputDirectoryManager.getAuthorizedDirectoryLabel(this) ?: treeUri}", Color.parseColor("#006400"))
             }
         }
     }
