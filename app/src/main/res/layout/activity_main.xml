@@ -200,6 +200,16 @@
                 android:backgroundTint="#BDBDBD"
                 android:textColor="#FFFFFF" />
 
+            <TextView
+                android:id="@+id/app_info_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:gravity="end"
+                android:text="版本: --  作者: --"
+                android:textColor="#888888"
+                android:textSize="11sp" />
+
         </LinearLayout>
     </ScrollView>
 

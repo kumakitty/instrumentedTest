@@ -48,6 +48,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var calibrationFileSpinner: Spinner
     private lateinit var currentTestDataText: TextView
     private lateinit var outputDirText: TextView
+    private lateinit var appInfoText: TextView
     private lateinit var evaluationEditText: EditText
     
     private lateinit var prefs: SharedPreferences
@@ -108,6 +109,8 @@ class MainActivity : AppCompatActivity() {
         private const val SCREEN_CAPTURE_REQUEST_CODE = 1002
         private const val OPEN_DIRECTORY_REQUEST_CODE = 1003
         private const val TAG = "Calibration"
+        // 修改这里即可更新作者信息显示
+        private const val APP_AUTHOR = "KUMA"
     }
 
     @SuppressLint("MissingInflatedId")
@@ -130,6 +133,7 @@ class MainActivity : AppCompatActivity() {
         calibrationFileSpinner = findViewById(R.id.calibration_file_spinner)
         currentTestDataText = findViewById(R.id.current_test_data_text)
         outputDirText = findViewById(R.id.output_dir_text)
+        appInfoText = findViewById(R.id.app_info_text)
         evaluationEditText = findViewById(R.id.evaluation_edit_text)
 
         projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -140,6 +144,7 @@ class MainActivity : AppCompatActivity() {
         refreshCalibrationList()
         refreshFileInfo()
         refreshOutputDirectoryInfo()
+        refreshAppInfoLabel()
 
         if (intent.getBooleanExtra(EXTRA_IS_TEST_MODE, false)) {
             findViewById<View>(R.id.start_test_button).visibility = View.GONE
@@ -240,6 +245,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshOutputDirectoryInfo() {
         outputDirText.text = OutputDirectoryManager.buildStatusText(this)
+    }
+
+    private fun refreshAppInfoLabel() {
+        val version = runCatching {
+            @Suppress("DEPRECATION")
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "--"
+        }.getOrDefault("--")
+        appInfoText.text = "版本: $version  作者: $APP_AUTHOR"
     }
 
     private fun requestDirectoryPermission() {
