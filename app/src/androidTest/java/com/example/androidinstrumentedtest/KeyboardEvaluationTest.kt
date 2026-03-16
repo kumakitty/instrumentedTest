@@ -260,7 +260,7 @@ class KeyboardEvaluationTest {
             }
             Log.d(tag, "   Captured candidate area: ${candidateBitmap.width}x${candidateBitmap.height}")
 
-            val ocrResult = runOcrSingleLineInOrder(candidateBitmap)
+            val ocrResult = runOcrSingleLineInOrder(candidateBitmap, target)
             val tokens = ocrResult.tokens
             result.attempts.addAll(tokens)
             Log.d(tag, "   OCR tokens: ${tokens.size} candidates")
@@ -358,7 +358,7 @@ class KeyboardEvaluationTest {
         return ok
     }
 
-    private fun runOcrSingleLineInOrder(bitmap: Bitmap): OcrResult {
+    private fun runOcrSingleLineInOrder(bitmap: Bitmap, targetHint: String? = null): OcrResult {
         Log.d(tag, "===== OCR: ${bitmap.width}x${bitmap.height} =====")
 
         // 1. 分割候选词区域
@@ -378,7 +378,8 @@ class KeyboardEvaluationTest {
                 val h = (rect.bottom - rect.top).coerceAtLeast(1)
                 val block = Bitmap.createBitmap(bitmap, rect.left, rect.top, w, h)
 
-                val token = recognizeBestBlockToken(block, i)
+                val perBlockTarget = if (i == 0) targetHint else null
+                val token = recognizeBestBlockToken(block, i, perBlockTarget)
                 Log.d(tag, "Block[$i] final token: '$token'")
 
                 if (token.isNotEmpty()) candidates.add(token)
@@ -392,7 +393,7 @@ class KeyboardEvaluationTest {
         return OcrResult(rawText = candidates.joinToString(" "), tokens = candidates)
     }
 
-    private fun recognizeBestBlockToken(block: Bitmap, index: Int): String {
+    private fun recognizeBestBlockToken(block: Bitmap, index: Int, targetHint: String? = null): String {
         val attempts = mutableListOf<Pair<String, Bitmap>>()
         val generated = mutableListOf<Bitmap>()
 
@@ -404,20 +405,37 @@ class KeyboardEvaluationTest {
         generated.add(padded3x)
         val enhanced = toBinaryHighContrast(padded2x)
         generated.add(enhanced)
+        val grayscale2x = toGrayScale(padded2x)
+        generated.add(grayscale2x)
+        val colorNormalized = normalizeColoredText(padded2x)
+        generated.add(colorNormalized)
+        val colorNormalized3x = scaleBitmap(colorNormalized, 1.5f)
+        generated.add(colorNormalized3x)
+        val binary175 = toBinaryHighContrast(colorNormalized, 175)
+        generated.add(binary175)
+        val binaryDilated = dilateBlackText(binary175, radius = 1)
+        generated.add(binaryDilated)
 
         attempts.add("base" to block)
         attempts.add("padded" to padded)
         attempts.add("padded2x" to padded2x)
         attempts.add("padded3x" to padded3x)
         attempts.add("binary2x" to enhanced)
+        attempts.add("gray2x" to grayscale2x)
+        attempts.add("color_norm2x" to colorNormalized)
+        // 首候选常为橙色高亮，追加更大尺度的彩色归一化图作为兜底。
+        attempts.add("color_norm3x" to colorNormalized3x)
+        attempts.add("binary175" to binary175)
+        attempts.add("binary175_dilate" to binaryDilated)
 
         var best = ""
         var bestScore = Int.MIN_VALUE
+        val normalizedTarget = targetHint?.trim().orEmpty()
 
         attempts.forEach { (name, bmp) ->
             val raw = runBlocking { ocrHelper.recognizeText(bmp) }.text.trim()
             val normalized = normalizeChineseToken(raw)
-            val score = scoreChineseToken(raw, normalized)
+            val score = scoreChineseToken(raw, normalized, normalizedTarget)
             Log.d(tag, "Block[$index][$name] raw='$raw' normalized='$normalized' score=$score")
             if (score > bestScore) {
                 bestScore = score
@@ -436,13 +454,24 @@ class KeyboardEvaluationTest {
         return noSpaces.filter { ch -> ch.code in 0x4E00..0x9FFF }
     }
 
-    private fun scoreChineseToken(raw: String, normalized: String): Int {
+    private fun scoreChineseToken(raw: String, normalized: String, targetHint: String = ""): Int {
         if (normalized.isEmpty()) return Int.MIN_VALUE / 2
         val chineseCount = normalized.length
         val rawLen = raw.length.coerceAtLeast(1)
         val chineseRatio = (chineseCount * 100) / rawLen
         // 优先更长的中文结果，同时奖励“中文占比高”的结果。
-        return chineseCount * 100 + chineseRatio
+        var score = chineseCount * 100 + chineseRatio
+
+        // 首候选词使用目标词提示进行重排序，提升“贸易港→易港路”这类误识别的纠正机会。
+        if (targetHint.isNotBlank()) {
+            val sim = calculateSimilarity(normalized, targetHint)
+            val dist = levenshteinDistance(normalized, targetHint)
+            score += (sim * 500).toInt()
+            if (normalized == targetHint) score += 2000
+            if (dist == 1) score += 200
+            if (dist == 2 && targetHint.length >= 3) score += 80
+        }
+        return score
     }
 
     private fun addWhitePadding(src: Bitmap, padX: Int, padY: Int): Bitmap {
@@ -461,16 +490,83 @@ class KeyboardEvaluationTest {
         return Bitmap.createScaledBitmap(src, w, h, true)
     }
 
-    private fun toBinaryHighContrast(src: Bitmap): Bitmap {
+    private fun toBinaryHighContrast(src: Bitmap, threshold: Int = 190): Bitmap {
         val w = src.width
         val h = src.height
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val threshold = 190
         for (y in 0 until h) {
             for (x in 0 until w) {
                 val p = src.getPixel(x, y)
                 val lum = (Color.red(p) * 299 + Color.green(p) * 587 + Color.blue(p) * 114) / 1000
                 out.setPixel(x, y, if (lum < threshold) Color.BLACK else Color.WHITE)
+            }
+        }
+        return out
+    }
+
+    private fun toGrayScale(src: Bitmap): Bitmap {
+        val w = src.width
+        val h = src.height
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val p = src.getPixel(x, y)
+                val lum = (Color.red(p) * 299 + Color.green(p) * 587 + Color.blue(p) * 114) / 1000
+                out.setPixel(x, y, Color.rgb(lum, lum, lum))
+            }
+        }
+        return out
+    }
+
+    private fun normalizeColoredText(src: Bitmap): Bitmap {
+        val w = src.width
+        val h = src.height
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val hsv = FloatArray(3)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val p = src.getPixel(x, y)
+                val r = Color.red(p)
+                val g = Color.green(p)
+                val b = Color.blue(p)
+                Color.RGBToHSV(r, g, b, hsv)
+                val lum = (r * 299 + g * 587 + b * 114) / 1000
+
+                // 把高饱和暖色字（橙/红高亮）压成黑字；注意亮橙色 V 值常接近 1，不能按亮度排除。
+                val hue = hsv[0]
+                val sat = hsv[1]
+                val value = hsv[2]
+                val isWarmColoredText = sat > 0.16f && value > 0.35f && (hue <= 65f || hue >= 330f)
+                if (isWarmColoredText || lum < 180) {
+                    out.setPixel(x, y, Color.BLACK)
+                } else {
+                    out.setPixel(x, y, Color.WHITE)
+                }
+            }
+        }
+        return out
+    }
+
+    private fun dilateBlackText(src: Bitmap, radius: Int): Bitmap {
+        if (radius <= 0) return src.copy(src.config ?: Bitmap.Config.ARGB_8888, false)
+        val w = src.width
+        val h = src.height
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        out.eraseColor(Color.WHITE)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val p = src.getPixel(x, y)
+                if (Color.red(p) < 128) {
+                    for (dy in -radius..radius) {
+                        for (dx in -radius..radius) {
+                            val nx = x + dx
+                            val ny = y + dy
+                            if (nx in 0 until w && ny in 0 until h) {
+                                out.setPixel(nx, ny, Color.BLACK)
+                            }
+                        }
+                    }
+                }
             }
         }
         return out
@@ -881,8 +977,10 @@ class KeyboardEvaluationTest {
             var cnt = 0
             for (x in 0 until width) {
                 val p = bitmap.getPixel(x, y)
-                val lum = (Color.red(p) * 299 + Color.green(p) * 587 + Color.blue(p) * 114) / 1000
-                if (lum < darkThreshold) cnt++
+                val r = Color.red(p)
+                val g = Color.green(p)
+                val b = Color.blue(p)
+                if (isInkPixel(r, g, b, darkThreshold)) cnt++
             }
             rowInk[y] = cnt
         }
@@ -910,12 +1008,23 @@ class KeyboardEvaluationTest {
             var cnt = 0
             for (y in top..bottom) {
                 val p = bitmap.getPixel(x, y)
-                val lum = (Color.red(p) * 299 + Color.green(p) * 587 + Color.blue(p) * 114) / 1000
-                if (lum < darkThreshold) cnt++
+                val r = Color.red(p)
+                val g = Color.green(p)
+                val b = Color.blue(p)
+                if (isInkPixel(r, g, b, darkThreshold)) cnt++
             }
             colInk[x] = cnt
         }
         return colInk
+    }
+
+    private fun isInkPixel(r: Int, g: Int, b: Int, darkThreshold: Int): Boolean {
+        val lum = (r * 299 + g * 587 + b * 114) / 1000
+        if (lum < darkThreshold) return true
+
+        // 首候选常为橙色高亮：亮度可能偏高，但仍应计为“有字墨迹”。
+        val isWarmHighlight = r >= 145 && g >= 70 && b <= 150 && (r - g) >= 18
+        return isWarmHighlight
     }
 
     private fun splitSingleRunByValleys(colInk: IntArray): List<IntRange> {
