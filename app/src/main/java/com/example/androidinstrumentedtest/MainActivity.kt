@@ -65,7 +65,15 @@ class MainActivity : AppCompatActivity() {
     private var isCalibrationUiShiftApplied = false
     private var calibrationUiShiftPx = 0
 
-    private val keyboardOptions = listOf("9键测试", "26键测试", "14键测试", "联想测试")
+    private val keyboardOptions = listOf(
+        "9键测试",
+        "9键带前文",
+        "26键测试",
+        "26键带前文",
+        "14键测试",
+        "14键带前文",
+        "联想测试"
+    )
     
     // 全量校准序列 (9键用)
     private val calibrationKeys9 = listOf(
@@ -220,7 +228,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun autoSelectMatchingCalibration() {
         val imeName = getCurrentImeName()
-        val kbType = keyboardTypeSpinner.selectedItem.toString().replace(" ", "_")
+        val kbType = getBaseKeyboardType(keyboardTypeSpinner.selectedItem.toString()).replace(" ", "_")
         val expectedPrefix = "cal_${imeName}_${kbType}"
         val adapter = calibrationFileSpinner.adapter
         for (i in 0 until adapter.count) {
@@ -343,7 +351,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCalibrationSequence() {
-        val kbType = keyboardTypeSpinner.selectedItem.toString()
+        val kbType = getBaseKeyboardType(keyboardTypeSpinner.selectedItem.toString())
         currentCalibrationKeys = when (kbType) {
             "26键测试" -> calibrationKeys26
             "14键测试" -> calibrationKeys14
@@ -454,12 +462,21 @@ class MainActivity : AppCompatActivity() {
         exitCalibrationUiMode()
         restoreCalibrationGuideShiftAndScroll()
         try {
-            val imeName = getCurrentImeName(); val kbType = keyboardTypeSpinner.selectedItem.toString().replace(" ", "_")
+            val imeName = getCurrentImeName(); val kbType = getBaseKeyboardType(keyboardTypeSpinner.selectedItem.toString()).replace(" ", "_")
             val fileName = "cal_${imeName}_${kbType}.json"; val file = File(File(filesDir, "InstrumentedTest"), fileName)
             FileOutputStream(file).use { it.write(calibrationPointsJson.toString().toByteArray()) }
             refreshCalibrationList(); setReportText("✅ 校准成功！文件已保存: $fileName", Color.parseColor("#006400"))
         } catch (e: Exception) { Log.e(TAG, "Save Error", e) }
         stopProjection()
+    }
+
+    private fun getBaseKeyboardType(selectedType: String): String {
+        return when (selectedType) {
+            "9键带前文" -> "9键测试"
+            "14键带前文" -> "14键测试"
+            "26键带前文" -> "26键测试"
+            else -> selectedType
+        }
     }
 
     private inner class CalibrationCircleView(context: Context) : View(context) {

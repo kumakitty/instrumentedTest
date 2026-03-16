@@ -145,12 +145,12 @@ class KeyboardEvaluationTest {
         }
         Thread.sleep(500)
 
-        testData.forEachIndexed { i, pair ->
-            val pinyin = pair.first
-            val target = pair.second
-            val result = EvaluationResult(pinyin, target)
+        testData.forEachIndexed { i, entry ->
+            val pinyin = entry.pinyin
+            val target = entry.target
+            val result = EvaluationResult(pinyin, target, contextText = entry.contextText.orEmpty())
 
-            runCandidateAreaEvaluation(result, target, pinyin)
+            runCandidateAreaEvaluation(result, target, pinyin, entry.contextText)
             results.add(result)
             sendPartialReport(result)
             Log.i(tag, "[$i] $pinyin -> $target, found=${result.wasFound}, pos=${result.selectedNo}")
@@ -190,10 +190,10 @@ class KeyboardEvaluationTest {
         }
     }
 
-    private fun runCandidateAreaEvaluation(result: EvaluationResult, target: String, pinyin: String) {
+    private fun runCandidateAreaEvaluation(result: EvaluationResult, target: String, pinyin: String, contextText: String? = null) {
         try {
             Log.i(tag, "➤ [${result.pinyinSequence}] START EVALUATION for target='$target'")
-            Log.i(tag, "   Mode check: keyboardMode='$keyboardMode', associationMode=${isAssociationMode()}")
+            Log.i(tag, "   Mode check: keyboardMode='$keyboardMode', baseMode='${baseKeyboardMode()}', associationMode=${isAssociationMode()}, withContext=${isContextMode()}")
 
             val et = findSafeEditText(2000)
             if (et == null) {
@@ -209,7 +209,7 @@ class KeyboardEvaluationTest {
             Log.d(tag, "   Clearing candidate bar: tap space then delete")
             et?.click()
             // 用校准坐标点击空格键
-            val spaceKey = if (keyboardMode in listOf("9键测试", "9-key")) "0" else "space"
+            val spaceKey = if (baseKeyboardMode() in listOf("9键测试", "9-key")) "0" else "space"
             manualPositions[spaceKey]?.let { rect ->
                 uiDevice.click(rect.centerX(), rect.centerY())
                 Log.d(tag, "   Tapped space at (${rect.centerX()}, ${rect.centerY()})")
@@ -219,6 +219,18 @@ class KeyboardEvaluationTest {
             clearTextViaDelete(et)
             Thread.sleep(200)
             Log.d(tag, "   Candidate bar cleared")
+
+            if (isContextMode() && !contextText.isNullOrBlank()) {
+                Log.i(tag, "   Prefix context input: '$contextText'")
+                val contextInputOk = writeDirectTextAndMoveCursorEnd(contextText)
+                if (!contextInputOk) {
+                    result.message = "ERROR: failed to input context text"
+                    Log.e(tag, "   Context input failed in context mode")
+                    return
+                }
+                Log.d(tag, "   Context input completed, cursor moved to end")
+                Thread.sleep(250)
+            }
 
             if (isAssociationMode()) {
                 // 联想测试：测试数据中的 pinyin 实际是中文，直接写入输入框并把光标放到末尾。
@@ -290,8 +302,17 @@ class KeyboardEvaluationTest {
         }
     }
 
-    private fun isAssociationMode(): Boolean {
-        return keyboardMode == "联想测试"
+    private fun isAssociationMode(): Boolean = keyboardMode == "联想测试"
+
+    private fun isContextMode(): Boolean = keyboardMode.contains("带前文")
+
+    private fun baseKeyboardMode(): String {
+        return when (keyboardMode) {
+            "9键带前文" -> "9键测试"
+            "14键带前文" -> "14键测试"
+            "26键带前文" -> "26键测试"
+            else -> keyboardMode
+        }
     }
 
     private fun writeDirectTextAndMoveCursorEnd(text: String): Boolean {
@@ -1094,7 +1115,7 @@ class KeyboardEvaluationTest {
 
     private fun pressKeyInternal(key: Char) {
         val keyChar = key.lowercaseChar()
-        val targetKeyStr = when (keyboardMode) {
+        val targetKeyStr = when (baseKeyboardMode()) {
             "9键测试", "9-key" -> when (keyChar) {
                 'a', 'b', 'c' -> "2"
                 'd', 'e', 'f' -> "3"
@@ -1169,7 +1190,7 @@ class KeyboardEvaluationTest {
     }
 
     private fun addKeyboardModeMapping(calibKey: String, rect: Rect) {
-        when (keyboardMode) {
+        when (baseKeyboardMode()) {
             "9键测试", "9-key" -> when (calibKey) {
                 "a", "b", "c" -> manualPositions["2"] = rect
                 "d", "e", "f" -> manualPositions["3"] = rect
@@ -1501,6 +1522,7 @@ class KeyboardEvaluationTest {
     data class EvaluationResult(
         val pinyinSequence: String,
         val targetWord: String,
+        val contextText: String = "",
         var wasFound: Boolean = false,
         var selectedWord: String = "",
         var selectedNo: Int = 0,
