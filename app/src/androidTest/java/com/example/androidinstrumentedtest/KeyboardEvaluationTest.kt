@@ -193,7 +193,8 @@ class KeyboardEvaluationTest {
     private fun runCandidateAreaEvaluation(result: EvaluationResult, target: String, pinyin: String) {
         try {
             Log.i(tag, "➤ [${result.pinyinSequence}] START EVALUATION for target='$target'")
-            
+            Log.i(tag, "   Mode check: keyboardMode='$keyboardMode', associationMode=${isAssociationMode()}")
+
             val et = findSafeEditText(2000)
             if (et == null) {
                 Log.w(tag, "   EditText not found by UiAutomator, use Activity fallback")
@@ -203,13 +204,41 @@ class KeyboardEvaluationTest {
                     return
                 }
             }
-            clearTextViaDelete(et)
 
-            pinyin.forEach {
-                pressKeyInternal(it)
-                Thread.sleep(90)
+            // 在正式输入前，向文本框输入一个空格再删除，清空候选词栏，避免上一条测试残留干扰。
+            Log.d(tag, "   Clearing candidate bar: tap space then delete")
+            et?.click()
+            // 用校准坐标点击空格键
+            val spaceKey = if (keyboardMode in listOf("9键测试", "9-key")) "0" else "space"
+            manualPositions[spaceKey]?.let { rect ->
+                uiDevice.click(rect.centerX(), rect.centerY())
+                Log.d(tag, "   Tapped space at (${rect.centerX()}, ${rect.centerY()})")
+            } ?: Log.w(tag, "   No calibration for space key '$spaceKey', skip space tap")
+            Thread.sleep(300)
+            // 用 clearTextViaDelete 删除刚才输入的空格
+            clearTextViaDelete(et)
+            Thread.sleep(200)
+            Log.d(tag, "   Candidate bar cleared")
+
+            if (isAssociationMode()) {
+                // 联想测试：测试数据中的 pinyin 实际是中文，直接写入输入框并把光标放到末尾。
+                Log.i(tag, "   Input strategy: DIRECT_TEXT (association mode), text='$pinyin'")
+                val directInputOk = writeDirectTextAndMoveCursorEnd(pinyin)
+                if (!directInputOk) {
+                    result.message = "ERROR: failed to input association text"
+                    Log.e(tag, "   Direct input failed in association mode")
+                    return
+                }
+                Log.d(tag, "   Association input completed: $pinyin")
+            } else {
+                Log.i(tag, "   Input strategy: KEY_PRESS (non-association mode), pinyin='$pinyin'")
+                pinyin.forEach {
+                    pressKeyInternal(it)
+                    Thread.sleep(90)
+                }
+                Log.d(tag, "   Input completed: $pinyin")
             }
-            Log.d(tag, "   Input completed: $pinyin")
+
             Thread.sleep(1000)
 
             val candidateBitmap = captureCandidateAreaBitmap() ?: run {
@@ -259,6 +288,53 @@ class KeyboardEvaluationTest {
             Log.e(tag, "Evaluation error", e)
             result.message = "ERROR: ${e.message}"
         }
+    }
+
+    private fun isAssociationMode(): Boolean {
+        return keyboardMode == "联想测试"
+    }
+
+    private fun writeDirectTextAndMoveCursorEnd(text: String): Boolean {
+        // 先尝试 UiAutomator 路径。
+        val uiObj = findSafeEditText(1200)
+        if (uiObj != null) {
+            try {
+                uiObj.click()
+                uiObj.text = text
+                // UiObject2 无法显式 setSelection，补一次 Activity fallback 只做光标定位。
+                return moveCursorToEndViaActivity(text)
+            } catch (e: Exception) {
+                Log.w(tag, "UiAutomator direct input failed: ${e.message}")
+            }
+        }
+        // 回退到 Activity 内直接设置文本和光标。
+        return moveCursorToEndViaActivity(text)
+    }
+
+    private fun moveCursorToEndViaActivity(text: String): Boolean {
+        val latch = CountDownLatch(1)
+        var ok = false
+        activityRule.activity.runOnUiThread {
+            try {
+                val et = activityRule.activity.findViewById<android.widget.EditText>(R.id.evaluation_edit_text)
+                if (et != null) {
+                    et.visibility = android.view.View.VISIBLE
+                    et.isEnabled = true
+                    et.isFocusableInTouchMode = true
+                    et.requestFocus()
+                    et.performClick()
+                    et.setText(text)
+                    et.setSelection(et.text?.length ?: text.length)
+                    ok = true
+                }
+            } catch (_: Exception) {
+                ok = false
+            } finally {
+                latch.countDown()
+            }
+        }
+        latch.await(1500, TimeUnit.MILLISECONDS)
+        return ok
     }
 
     private fun runOcrSingleLineInOrder(bitmap: Bitmap): OcrResult {
@@ -1041,9 +1117,11 @@ class KeyboardEvaluationTest {
                 'd', 'f' -> "df"
                 'g', 'h' -> "gh"
                 'j', 'k' -> "jk"
+                'l'  -> "l"
                 'z', 'x' -> "zx"
                 'c', 'v' -> "cv"
                 'b', 'n' -> "bn"
+                'm'  -> "m"
                 ' ' -> "space"
                 else -> keyChar.toString()
             }
