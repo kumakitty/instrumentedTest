@@ -428,22 +428,50 @@ class KeyboardEvaluationTest {
         attempts.add("binary175" to binary175)
         attempts.add("binary175_dilate" to binaryDilated)
 
-        var best = ""
-        var bestScore = Int.MIN_VALUE
         val normalizedTarget = targetHint?.trim().orEmpty()
+        // Collect (normalizedText, score) for every variant; also tally vote counts.
+        val resultEntries = mutableListOf<Pair<String, Int>>()
+        val voteCounts = mutableMapOf<String, Int>()
 
         attempts.forEach { (name, bmp) ->
             val raw = runBlocking { ocrHelper.recognizeText(bmp) }.text.trim()
             val normalized = normalizeChineseToken(raw)
             val score = scoreChineseToken(raw, normalized, normalizedTarget)
             Log.d(tag, "Block[$index][$name] raw='$raw' normalized='$normalized' score=$score")
-            if (score > bestScore) {
-                bestScore = score
-                best = normalized
+            if (normalized.isNotEmpty()) {
+                resultEntries.add(normalized to score)
+                voteCounts[normalized] = (voteCounts[normalized] ?: 0) + 1
             }
         }
 
         generated.forEach { it.recycle() }
+
+        if (resultEntries.isEmpty()) return ""
+
+        // Phase 1: Majority voting – if any candidate appears in ≥ 50% of variants, use it directly
+        // to prevent a single bad preprocessing result from overriding the consensus.
+        val totalVotes = resultEntries.size
+        val majorityWinner = voteCounts.entries
+            .filter { it.value * 2 >= totalVotes }
+            .maxByOrNull { it.value }
+            ?.key
+        if (majorityWinner != null) {
+            Log.d(tag, "Block[$index] VOTE_WINNER='$majorityWinner' (${voteCounts[majorityWinner]}/$totalVotes)")
+            return majorityWinner
+        }
+
+        // Phase 2: Vote-boosted scoring – add a large bonus per vote so that the most-agreed-upon
+        // result wins ties and small score differences caused by preprocessing artifacts.
+        var best = ""
+        var bestScore = Int.MIN_VALUE
+        resultEntries.forEach { (normalized, score) ->
+            val boosted = score + (voteCounts[normalized] ?: 0) * 400
+            if (boosted > bestScore) {
+                bestScore = boosted
+                best = normalized
+            }
+        }
+        Log.d(tag, "Block[$index] VOTE_SCORE_WINNER='$best'")
         return best
     }
 
