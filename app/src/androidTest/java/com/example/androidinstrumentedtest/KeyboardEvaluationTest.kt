@@ -27,6 +27,7 @@ import androidx.test.uiautomator.Until
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.After
+import org.junit.Assert.assertEquals
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -478,8 +479,47 @@ class KeyboardEvaluationTest {
     private fun normalizeChineseToken(raw: String): String {
         if (raw.isBlank()) return ""
         val noSpaces = raw.replace(" ", "").replace("\n", "")
-        // 候选词只保留中文，去掉误识别的拉丁字母/符号。
-        return noSpaces.filter { ch -> ch.code in 0x4E00..0x9FFF }
+        // 候选词优先保留中文，同时允许英文/数字（如“白小E”）。
+        return noSpaces.filter { ch ->
+            (ch.code in 0x4E00..0x9FFF) || ch.isLetterOrDigit()
+        }
+    }
+
+    @Test
+    fun testAssets1wordSplitAndOcr() {
+        val bitmap = loadAssetBitmap("test/1word.png")
+        val result = runOcrSingleLineInOrder(bitmap)
+        val expected = listOf("当", "挡", "党", "档", "荡", "裆", "档")
+        Log.i(tag, "1word tokens=${result.tokens}")
+        assertEquals("1word 切分识别结果不匹配", expected, result.tokens)
+        bitmap.recycle()
+    }
+
+    @Test
+    fun testAssets2wordsSplitAndOcr() {
+        val bitmap = loadAssetBitmap("test/2words.png")
+        val result = runOcrSingleLineInOrder(bitmap)
+        val expected = listOf("放学", "发型", "风险", "放心", "分享")
+        Log.i(tag, "2words tokens=${result.tokens}")
+        assertEquals("2words 切分识别结果不匹配", expected, result.tokens)
+        bitmap.recycle()
+    }
+
+    @Test
+    fun testAssets3wordsSplitAndOcr() {
+        val bitmap = loadAssetBitmap("test/3words.png")
+        val result = runOcrSingleLineInOrder(bitmap)
+        val expected = listOf("甜啦啦", "田林路", "太累了", "太懒了")
+        Log.i(tag, "3words tokens=${result.tokens}")
+        assertEquals("3words 切分识别结果不匹配", expected, result.tokens)
+        bitmap.recycle()
+    }
+
+    private fun loadAssetBitmap(assetPath: String): Bitmap {
+        instrumentation.targetContext.assets.open(assetPath).use { input ->
+            return BitmapFactory.decodeStream(input)
+                ?: throw AssertionError("无法解码 assets 文件: $assetPath")
+        }
     }
 
     private fun scoreChineseToken(raw: String, normalized: String, targetHint: String = ""): Int {
@@ -937,6 +977,7 @@ class KeyboardEvaluationTest {
 
         // 先把非常窄的小碎块并到邻居，减少抗锯齿引起的过切。
         val minTinyRun = (width * 0.006f).toInt().coerceAtLeast(3)
+        val tinyMergeGap = (width * 0.0025f).toInt().coerceIn(1, 4)
         val compactRuns = mutableListOf<IntRange>()
         inkRuns.forEach { run ->
             val runW = run.last - run.first + 1
@@ -945,7 +986,7 @@ class KeyboardEvaluationTest {
             } else {
                 val prev = compactRuns.last()
                 val gap = run.first - prev.last - 1
-                if (runW <= minTinyRun && gap <= 10) {
+                if (runW <= minTinyRun && gap <= tinyMergeGap) {
                     compactRuns[compactRuns.lastIndex] = prev.first..run.last
                 } else {
                     compactRuns.add(run)
@@ -964,7 +1005,7 @@ class KeyboardEvaluationTest {
             gaps.add((compactRuns[i + 1].first - compactRuns[i].last - 1).coerceAtLeast(0))
         }
 
-        val splitThreshold = calcAdaptiveSplitThreshold(gaps).coerceAtLeast(10)
+        val splitThreshold = calcAdaptiveSplitThreshold(gaps).coerceAtLeast(6)
         val wordRuns = mutableListOf<IntRange>()
         var curRun = compactRuns[0]
         for (i in 1 until compactRuns.size) {
@@ -979,7 +1020,123 @@ class KeyboardEvaluationTest {
         }
         wordRuns.add(curRun)
 
-        return runsToRects(wordRuns, width, height, bandTop, bandBottom)
+        // 单字候选词异常兜底：常见形态是 [首词][中间超宽粘连块][末词]。
+        // 仅在中间块显著偏宽时做受限二次切分，避免影响双字词正常路径。
+        val refinedRuns = mutableListOf<IntRange>()
+        val baseWidths = wordRuns.map { it.last - it.first + 1 }
+        val edgeWidthRef = when {
+            wordRuns.size >= 3 -> ((baseWidths.first() + baseWidths.last()) / 2f)
+            wordRuns.size == 2 -> baseWidths.first().toFloat()
+            else -> baseWidths.firstOrNull()?.toFloat() ?: 0f
+        }
+
+        fun splitByLowInkRuns(localInk: IntArray): List<IntRange> {
+            if (localInk.isEmpty()) return emptyList()
+            val n = localInk.size
+            val minInk = localInk.minOrNull() ?: 0
+            val maxInk = localInk.maxOrNull() ?: 0
+            if (maxInk - minInk < 2) return emptyList()
+
+            val lowInkThreshold = (minInk + (maxInk - minInk) * 0.22f).toInt()
+            val minGapWidth = (n * 0.006f).toInt().coerceAtLeast(2)
+            val boundaries = mutableListOf<Int>()
+
+            var s = -1
+            for (x in 0 until n) {
+                if (localInk[x] <= lowInkThreshold) {
+                    if (s < 0) s = x
+                } else if (s >= 0) {
+                    val e = x - 1
+                    if (e - s + 1 >= minGapWidth) boundaries.add((s + e) / 2)
+                    s = -1
+                }
+            }
+            if (s >= 0) {
+                val e = n - 1
+                if (e - s + 1 >= minGapWidth) boundaries.add((s + e) / 2)
+            }
+            if (boundaries.isEmpty()) return emptyList()
+
+            val minWordWidth = (n * 0.02f).toInt().coerceAtLeast(8)
+            val out = mutableListOf<IntRange>()
+            var left = 0
+            boundaries.sorted().forEach { b ->
+                val right = b - 1
+                if (right - left + 1 >= minWordWidth) out.add(left..right)
+                left = b + 1
+            }
+            if (n - left >= minWordWidth) out.add(left..(n - 1))
+            return out
+        }
+
+        wordRuns.forEachIndexed { idx, run ->
+            val runWidth = run.last - run.first + 1
+            val isMiddle = idx in 1 until wordRuns.lastIndex
+            val isTailInTwoRunCase = wordRuns.size == 2 && idx == wordRuns.lastIndex
+            val refineCandidate = isMiddle || isTailInTwoRunCase
+            val looksMergedSingleCharBlock = refineCandidate && edgeWidthRef > 0f && runWidth >= edgeWidthRef * 2.25f
+
+            if (!looksMergedSingleCharBlock) {
+                refinedRuns.add(run)
+                return@forEachIndexed
+            }
+
+            val local = smoothed.copyOfRange(run.first, run.last + 1)
+            var localRuns = splitSingleRunByValleys(local)
+            if (localRuns.size <= 1) {
+                localRuns = splitByLowInkRuns(local)
+            }
+            if (localRuns.size <= 1) {
+                refinedRuns.add(run)
+                return@forEachIndexed
+            }
+
+            val mapped = localRuns.map { (run.first + it.first)..(run.first + it.last) }
+            val minPieceWidth = (width * 0.012f).toInt().coerceAtLeast(8)
+            val filtered = mapped.filter { (it.last - it.first + 1) >= minPieceWidth }
+
+            if (filtered.size <= 1) {
+                refinedRuns.add(run)
+                return@forEachIndexed
+            }
+
+            val pieceWidths = filtered.map { it.last - it.first + 1 }
+            val maxPiece = pieceWidths.maxOrNull() ?: runWidth
+            val minPiece = pieceWidths.minOrNull() ?: 0
+            val pieceMedian = pieceWidths.sorted()[pieceWidths.size / 2].toFloat()
+            val pieceGaps = mutableListOf<Int>()
+            for (i in 0 until filtered.size - 1) {
+                pieceGaps.add((filtered[i + 1].first - filtered[i].last - 1).coerceAtLeast(0))
+            }
+            val minGap = pieceGaps.minOrNull() ?: 0
+
+            // 保护条件：
+            // 1) 不允许出现明显过切（最小块太窄）；
+            // 2) 分块宽度需接近边缘单字宽度；
+            // 3) 分块间至少有可见空隙。
+            val noOverSplit = minPiece >= (edgeWidthRef * 0.55f).toInt().coerceAtLeast(7)
+            val widthSimilarToEdge = pieceMedian in (edgeWidthRef * 0.55f)..(edgeWidthRef * 1.85f)
+            val hasVisibleGaps = minGap >= 2
+            val notDominatedByHugePiece = maxPiece <= (edgeWidthRef * 2.0f).toInt().coerceAtLeast(minPieceWidth)
+
+            // 两段场景（[首词][后续粘连]）放宽判定，避免漏触发导致只分出第1词。
+            val tailTwoRunAccept = isTailInTwoRunCase &&
+                filtered.size >= 2 &&
+                minPiece >= (edgeWidthRef * 0.50f).toInt().coerceAtLeast(7) &&
+                minGap >= 1
+
+            if (tailTwoRunAccept || (noOverSplit && widthSimilarToEdge && hasVisibleGaps && notDominatedByHugePiece)) {
+                Log.d(
+                    tag,
+                    "Split refine middle-run: idx=$idx runW=$runWidth edgeRef=${"%.1f".format(edgeWidthRef)} parts=${filtered.size} partW=$pieceWidths gaps=$pieceGaps"
+                )
+                refinedRuns.addAll(filtered)
+            } else {
+                refinedRuns.add(run)
+            }
+        }
+
+        return runsToRects(refinedRuns, width, height, bandTop, bandBottom)
     }
 
     private fun runsToRects(runs: List<IntRange>, width: Int, height: Int, bandTop: Int, bandBottom: Int): List<Rect> {
