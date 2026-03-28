@@ -71,6 +71,11 @@ class KeyboardEvaluationTest {
     private val manualPositions = mutableMapOf<String, Rect>()
     private val results = mutableListOf<EvaluationResult>()
     private lateinit var debugDir: File
+    private var reportTimestamp: String = ""
+    private var liveReportFile: File? = null
+    private var liveReportLatestFile: File? = null
+    private var liveReportCopyFile: File? = null
+    private var plannedCaseCount: Int = 0
 
     @Before
     fun setup() {
@@ -132,6 +137,11 @@ class KeyboardEvaluationTest {
             throw AssertionError(msg)
         }
 
+        plannedCaseCount = testData.size
+        ensureLiveReportFilesInitialized()
+        flushLiveReport(stage = "STARTED")
+        showLiveReportPathOnUi("测试开始，已创建实时报告")
+
         val edit = findSafeEditText(5000)
         if (edit == null) {
             Log.w(tag, "UiAutomator 未找到 evaluation_edit_text，尝试 Activity fallback")
@@ -139,6 +149,7 @@ class KeyboardEvaluationTest {
             if (!fallbackOk) {
                 val msg = "未找到 evaluation_edit_text，评测已中止"
                 Log.e(tag, msg)
+                flushLiveReport(stage = "ABORTED", extraMessage = msg)
                 throw AssertionError(msg)
             }
         } else {
@@ -154,40 +165,111 @@ class KeyboardEvaluationTest {
             runCandidateAreaEvaluation(result, target, pinyin, entry.contextText)
             results.add(result)
             sendPartialReport(result)
+            flushLiveReport(stage = "RUNNING")
             Log.i(tag, "[$i] $pinyin -> $target, found=${result.wasFound}, pos=${result.selectedNo}")
             Thread.sleep(400)
         }
+        flushLiveReport(stage = "COMPLETED")
         Log.i(tag, "=== runKeyboardEvaluation END ===")
     }
 
     @After
     fun generateReport() {
-        if (results.isEmpty()) {
-            Log.w(tag, "generateReport skipped: results is empty")
-            return
-        }
-        val report = buildFinalReport()
-        
-        // 保存报告到 OUTPUT_DIR 根目录，并额外复制一份到 failed_tests 子目录
-        val timestamp = SimpleDateFormat("yyyy-MM-dd_HHmmss", Locale.getDefault()).format(Date())
-        val reportFile = File(debugDir, "evaluation_report_${timestamp}.txt")
-        val rootSaved = writeTextFile(reportFile, report)
-        if (rootSaved) Log.i(tag, "✓ Report saved: ${reportFile.absolutePath}") else Log.e(tag, "✗ Report save failed: ${reportFile.absolutePath}")
-
-        val failedDir = File(debugDir, "failed_tests").apply { mkdirs() }
-        val failedReportFile = File(failedDir, "evaluation_report_${timestamp}.txt")
-        val failedSaved = writeTextFile(failedReportFile, report)
-        if (failedSaved) Log.i(tag, "✓ Report copy saved: ${failedReportFile.absolutePath}") else Log.e(tag, "✗ Report copy save failed: ${failedReportFile.absolutePath}")
+        ensureLiveReportFilesInitialized()
+        val stage = if (results.isEmpty()) "FINISHED_NO_RESULTS" else "FINISHED"
+        val flushed = flushLiveReport(stage = stage)
+        val outputListing = listOutputDirFiles().joinToString("\n")
 
         logOutputDirectorySummary()
         
         activityRule.activity.runOnUiThread {
             val msg = when {
-                failedSaved -> "Done: ${failedReportFile.absolutePath}"
-                rootSaved -> "Done: ${reportFile.absolutePath}"
+                flushed -> {
+                    val main = liveReportFile?.absolutePath ?: OUTPUT_DIR
+                    if (outputListing.isBlank()) {
+                        "Done: $main\n目录: $OUTPUT_DIR"
+                    } else {
+                        "Done: $main\n目录文件:\n$outputListing"
+                    }
+                }
                 else -> "❌ 报告保存失败，请查看 Logcat: $tag"
             }
             activityRule.activity.setReportText(msg, Color.parseColor("#006400"))
+        }
+    }
+
+    private fun ensureLiveReportFilesInitialized() {
+        if (liveReportFile != null && liveReportLatestFile != null && liveReportCopyFile != null) return
+
+        if (reportTimestamp.isBlank()) {
+            reportTimestamp = SimpleDateFormat("yyyy-MM-dd_HHmmss", Locale.getDefault()).format(Date())
+        }
+
+        liveReportFile = File(debugDir, "keyboard_evaluation_report_${reportTimestamp}.txt")
+        liveReportLatestFile = File(debugDir, "keyboard_evaluation_report_latest.txt")
+        val failedDir = File(debugDir, "failed_tests").apply { mkdirs() }
+        liveReportCopyFile = File(failedDir, "keyboard_evaluation_report_${reportTimestamp}.txt")
+    }
+
+    private fun flushLiveReport(stage: String, extraMessage: String = ""): Boolean {
+        ensureLiveReportFilesInitialized()
+
+        val reportBody = buildFinalReport()
+        val now = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+        val completed = results.size
+        val total = plannedCaseCount.coerceAtLeast(completed)
+        
+        // 计算进度统计
+        val successCount = results.count { it.wasFound }
+        val failureCount = completed - successCount
+        val successRate = if (completed > 0) (successCount * 100.0 / completed).toInt() else 0
+        
+        // 最后一条结果摘要
+        val lastResultSummary = results.lastOrNull()?.let { r ->
+            "Last: [${keyboardMode}] ${r.pinyinSequence} → ${r.targetWord} | ${if (r.wasFound) "✓ FOUND(#${r.selectedNo + 1})" else "✗ NOT_FOUND"}"
+        } ?: "N/A"
+        
+        val header = buildString {
+            appendLine("=========== EVALUATION LIVE REPORT ===========")
+            appendLine("Stage: $stage")
+            appendLine("Updated: $now")
+            appendLine("Progress: $completed/$total (Success: $successCount, Failed: $failureCount, Rate: $successRate%)")
+            appendLine(lastResultSummary)
+            if (extraMessage.isNotBlank()) appendLine("Message: $extraMessage")
+            appendLine("==============================================")
+            appendLine()
+        }
+        val fullText = header + reportBody
+
+        val mainFile = liveReportFile
+        val latestFile = liveReportLatestFile
+        val copyFile = liveReportCopyFile
+        if (mainFile == null || latestFile == null || copyFile == null) {
+            Log.e(tag, "flushLiveReport failed: report file not initialized")
+            return false
+        }
+
+        val mainSaved = writeTextFile(mainFile, fullText)
+        val latestSaved = writeTextFile(latestFile, fullText)
+        val copySaved = writeTextFile(copyFile, fullText)
+
+        Log.i(tag, "📄 Report flush [$stage] progress=$completed/$total")
+        Log.i(tag, "   main   (${if (mainSaved) "✓" else "✗"}): ${mainFile.absolutePath}")
+        Log.i(tag, "   latest (${if (latestSaved) "✓" else "✗"}): ${latestFile.absolutePath}")
+        Log.i(tag, "   copy   (${if (copySaved) "✓" else "✗"}): ${copyFile.absolutePath}")
+
+        return mainSaved || latestSaved || copySaved
+    }
+
+    private fun showLiveReportPathOnUi(prefix: String) {
+        ensureLiveReportFilesInitialized()
+        val sessionPath = liveReportFile?.absolutePath ?: OUTPUT_DIR
+        val latestPath = liveReportLatestFile?.absolutePath ?: OUTPUT_DIR
+        activityRule.activity.runOnUiThread {
+            activityRule.activity.setReportText(
+                "$prefix\n实时报告: $sessionPath\nlatest: $latestPath",
+                Color.parseColor("#006400")
+            )
         }
     }
 
@@ -661,27 +743,45 @@ class KeyboardEvaluationTest {
             }
 
             val context = instrumentation.targetContext
-            if (OutputDirectoryManager.hasAuthorizedDirectory(context)) {
-                val relativePath = toRelativeOutputPath(file)
-                if (relativePath.isBlank()) {
-                    Log.e(tag, "Failed to resolve relative output path for ${file.absolutePath}")
-                    return false
-                }
-                val success = OutputDirectoryManager.writeBytes(context, relativePath, mimeType, data)
-                if (!success) {
-                    Log.e(tag, "SAF write failed: $relativePath")
-                }
-                success
-            } else if (isPublicOutputTarget(file) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                writeOutputFileViaMediaStore(file, mimeType, data)
-            } else {
+
+            // ── Try 1: 直接写文件（最可靠，WRITE_EXTERNAL_STORAGE 已授权时直接生效）
+            try {
                 file.parentFile?.mkdirs()
                 file.outputStream().use { out ->
                     out.write(data)
                     out.flush()
                 }
-                true
+                Log.d(tag, "✓ 直接写文件成功: ${file.absolutePath}")
+                return true
+            } catch (directErr: Exception) {
+                Log.d(tag, "直接写文件失败(${directErr.message})，尝试 SAF/MediaStore")
             }
+
+            // ── Try 2: MediaStore（优先保证 OUTPUT_DIR = Documents/InstrumentedTest）
+            if (isPublicOutputTarget(file) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val success = writeOutputFileViaMediaStore(file, mimeType, data)
+                if (success) {
+                    Log.d(tag, "✓ MediaStore 写入成功: ${file.name}")
+                    return true
+                }
+                Log.w(tag, "MediaStore 写入失败: ${file.name}")
+            }
+
+            // ── Try 3: SAF（最后兜底，可能写到用户授权目录，不一定是 OUTPUT_DIR）
+            if (OutputDirectoryManager.hasAuthorizedDirectory(context)) {
+                val relativePath = toRelativeOutputPath(file)
+                if (relativePath.isNotBlank()) {
+                    val success = OutputDirectoryManager.writeBytes(context, relativePath, mimeType, data)
+                    if (success) {
+                        Log.d(tag, "✓ SAF 写入成功: $relativePath")
+                        return true
+                    }
+                    Log.w(tag, "SAF 写入失败: $relativePath")
+                }
+            }
+
+            Log.e(tag, "✗ 所有写入方式均失败: ${file.absolutePath}")
+            false
         } catch (e: Exception) {
             Log.w(tag, "Failed to save file ${file.absolutePath}: ${e.message}")
             false
@@ -791,6 +891,24 @@ class KeyboardEvaluationTest {
             files.forEach { Log.i(tag, "   • $it") }
         } else {
             Log.i(tag, "📂 Output summary fallback path: ${debugDir.absolutePath}")
+            val files = listOutputDirFiles()
+            Log.i(tag, "📂 Output dir files (${files.size} items)")
+            files.forEach { Log.i(tag, "   • $it") }
+        }
+    }
+
+    private fun listOutputDirFiles(): List<String> {
+        return runCatching {
+            val dir = File(OUTPUT_DIR)
+            if (!dir.exists() || !dir.isDirectory) return emptyList()
+            dir.listFiles()
+                ?.sortedByDescending { it.lastModified() }
+                ?.take(20)
+                ?.map { f -> if (f.isDirectory) "${f.name}/" else f.name }
+                ?: emptyList()
+        }.getOrElse {
+            Log.w(tag, "listOutputDirFiles failed: ${it.message}")
+            emptyList()
         }
     }
 
@@ -1518,9 +1636,13 @@ class KeyboardEvaluationTest {
         val prev = results.getOrNull(results.size - 2)
         val prevText = prev?.let { "[Prev]\n${formatResult(it)}" } ?: ""
         val currText = "[Current]\n${formatResult(result)}"
+        val sessionPath = liveReportFile?.absolutePath ?: OUTPUT_DIR
+        val latestPath = liveReportLatestFile?.absolutePath ?: OUTPUT_DIR
+        val header = "[Report]\n实时报告: $sessionPath\nlatest: $latestPath"
         activityRule.activity.runOnUiThread {
             val color = if (result.wasFound) Color.parseColor("#006400") else Color.RED
-            activityRule.activity.setReportText(if (prevText.isNotEmpty()) "$prevText\n\n$currText" else currText, color)
+            val body = if (prevText.isNotEmpty()) "$header\n\n$prevText\n\n$currText" else "$header\n\n$currText"
+            activityRule.activity.setReportText(body, color)
         }
     }
 

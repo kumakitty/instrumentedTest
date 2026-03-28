@@ -245,7 +245,7 @@ class MainActivity : AppCompatActivity() {
         val testDataFile = File(configDir, "test_data.txt")
         if (testDataFile.exists()) {
             val preview = try { testDataFile.bufferedReader().useLines { lines -> lines.take(3).joinToString("\n") } } catch (e: Exception) { "" }
-            currentTestDataText.text = "当前测试文件: $originalName\n数据预览:\n$preview"
+            currentTestDataText.text = "当前测试文件: $originalName\n完整路径: ${testDataFile.absolutePath}\n数据预览:\n$preview"
         } else {
             currentTestDataText.text = "当前测试文件: 无"
         }
@@ -345,7 +345,10 @@ class MainActivity : AppCompatActivity() {
                 contentResolver.takePersistableUriPermission(treeUri, takeFlags)
                 OutputDirectoryManager.saveAuthorizedTreeUri(this, treeUri)
                 refreshOutputDirectoryInfo()
-                setReportText("✅ 已授权测试输出目录: ${OutputDirectoryManager.getAuthorizedDirectoryLabel(this) ?: treeUri}", Color.parseColor("#006400"))
+                val displayPath = OutputDirectoryManager.buildStatusText(this)
+                    .substringAfter(":\n").trim()
+                    .takeIf { it.isNotBlank() } ?: treeUri.toString()
+                setReportText("✅ 已授权测试输出目录:\n$displayPath", Color.parseColor("#006400"))
             }
         }
     }

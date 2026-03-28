@@ -47,11 +47,35 @@ object OutputDirectoryManager {
 
     fun buildStatusText(context: Context): String {
         val root = getAuthorizedRoot(context)
+        val fallbackPath = "/sdcard/Documents/InstrumentedTest"
         return if (root != null) {
-            val label = getAuthorizedDirectoryLabel(context) ?: root.name ?: "已授权目录"
-            "测试输出目录: $label"
+            // 尝试从 URI 中解析出人类可读的完整路径
+            val uri = getAuthorizedTreeUri(context)
+            val fullPath = resolveUriToPath(uri) ?: getAuthorizedDirectoryLabel(context) ?: root.name ?: "已授权目录"
+            "测试输出目录:\n$fullPath"
         } else {
-            "测试输出目录: 未授权（将回退到 Documents/InstrumentedTest）"
+            "测试输出目录（默认）:\n$fallbackPath"
+        }
+    }
+
+    private fun resolveUriToPath(uri: Uri?): String? {
+        uri ?: return null
+        return try {
+            // SAF tree URI 格式: content://com.android.externalstorage.documents/tree/primary%3ADocuments%2FInstrumentedTest
+            val lastSegment = uri.lastPathSegment ?: return null
+            // lastSegment 通常为 "primary:Documents/InstrumentedTest"
+            if (lastSegment.contains(':')) {
+                val parts = lastSegment.split(':', limit = 2)
+                val volumeType = parts[0]  // e.g. "primary"
+                val relativePart = parts[1] // e.g. "Documents/InstrumentedTest"
+                if (volumeType.equals("primary", ignoreCase = true)) {
+                    "/sdcard/$relativePart"
+                } else {
+                    "/storage/$volumeType/$relativePart"
+                }
+            } else null
+        } catch (e: Exception) {
+            null
         }
     }
 
